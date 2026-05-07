@@ -104,10 +104,13 @@ def build_index(embeddings, dim: int = None) -> faiss.Index:
     # 使用 L2 距离索引，不需要归一化
     index = faiss.IndexFlatL2(dim)
 
-    # 手动转换为 np.ndarray（C++ 层面的强制转换）
-    safe_embeddings = np.array(embeddings, copy=True, dtype=np.float32)
-    safe_embeddings = np.ascontiguousarray(safe_embeddings)
-    print(f"  safe_embeddings 类型: {type(safe_embeddings)}, flags: {safe_embeddings.flags}")
+    # 通过文件序列化绕开 SWIG 类型检测（应对 faiss/numpy 版本兼容问题）
+    import tempfile
+    tmp_path = os.path.join(tempfile.gettempdir(), "_faiss_emb.npy")
+    np.save(tmp_path, np.ascontiguousarray(np.array(embeddings, copy=True, dtype=np.float32)))
+    safe_embeddings = np.load(tmp_path)
+    os.remove(tmp_path)
+    print(f"  文件绕行后类型: {type(safe_embeddings)}, shape: {safe_embeddings.shape}")
 
     index.add(safe_embeddings)
     faiss.write_index(index, str(INDEX_PATH))
@@ -140,18 +143,20 @@ def load_chunks() -> list[str]:
 
 def search(query: str, embedder: Embedder, index: faiss.Index,
            chunks: list[str], top_k: int = 5) -> list[dict]:
-    """检索与 query 最相关的文本块"""
+    """检索与 query 最相关的文本块（使用 L2 距离）"""
     q_vec = embedder.embed([query])
-    if not q_vec.flags["C_CONTIGUOUS"]:
-        q_vec = np.ascontiguousarray(q_vec)
-    faiss.normalize_L2(q_vec)
-    scores, indices = index.search(q_vec, top_k)
+    # 确保数组格式
+    q_vec = np.ascontiguousarray(np.array(q_vec, copy=True, dtype=np.float32))
+    # L2 索引不需要归一化，直接用原始向量搜索
+    distances, indices = index.search(q_vec, top_k)
 
     results = []
-    for score, idx in zip(scores[0], indices[0]):
+    for dist, idx in zip(distances[0], indices[0]):
         if idx < len(chunks):
+            # L2 距离越小越相关，转换成 0-1 的相似度分数
+            similarity = 1.0 / (1.0 + float(dist))
             results.append({
-                "score": float(score),
+                "score": similarity,
                 "text": chunks[idx][:500],
                 "index": int(idx),
             })
