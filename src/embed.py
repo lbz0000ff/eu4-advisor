@@ -1,4 +1,4 @@
-"""Embedding + 向量索引管理（使用 fastembed 轻量方案）"""
+"""Embedding + 向量索引管理（CPU/GPU 通用版）"""
 
 import os
 import re
@@ -9,7 +9,6 @@ from typing import Optional
 
 import numpy as np
 import faiss
-from tqdm import tqdm
 
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -20,9 +19,7 @@ CHUNKS_PATH = DATA_DIR / "chunks.json"
 
 def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
     """将文本按段落和句子切分成块"""
-    # 先按 ## 或 ### 标题分割
     sections = re.split(r"\n(?=#{1,3}\s)", text)
-
     chunks = []
     for section in sections:
         if not section.strip():
@@ -35,8 +32,24 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]
     return chunks
 
 
+def _guess_providers() -> list[str]:
+    """自动检测可用的推理后端"""
+    providers = ["CPUExecutionProvider"]
+    try:
+        import onnxruntime
+        available = onnxruntime.get_available_providers()
+        # CUDA 优先
+        if "CUDAExecutionProvider" in available:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif "ROCMExecutionProvider" in available:
+            providers = ["ROCMExecutionProvider", "CPUExecutionProvider"]
+    except ImportError:
+        pass
+    return providers
+
+
 class Embedder:
-    """轻量 Embedding 模型封装"""
+    """轻量 Embedding 模型封装（自动选择 CPU/GPU）"""
 
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
         self.model_name = model_name
@@ -46,17 +59,25 @@ class Embedder:
     def model(self):
         if self._model is None:
             from fastembed import TextEmbedding
+            providers = _guess_providers()
             print(f"加载 Embedding 模型: {self.model_name}")
+            print(f"推理后端: {providers}")
             t0 = time.time()
-            self._model = TextEmbedding(model_name=self.model_name)
+            self._model = TextEmbedding(
+                model_name=self.model_name,
+                providers=providers,
+            )
             print(f"模型加载完成 ({time.time() - t0:.1f}s)")
         return self._model
 
     def embed(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
-        """批量 embedding，返回 float32 numpy 数组"""
+        """批量 embedding，返回 contiguous float32 numpy 数组"""
         print(f"Embedding {len(texts)} 个文本块...")
         all_vectors = list(self.model.embed(texts, batch_size=batch_size))
         embeddings = np.array(all_vectors, dtype="float32")
+        # 确保是 contiguous 数组（FAISS 要求）
+        if not embeddings.flags["C_CONTIGUOUS"]:
+            embeddings = np.ascontiguousarray(embeddings)
         return embeddings
 
 
@@ -64,8 +85,18 @@ def build_index(embeddings: np.ndarray) -> faiss.Index:
     """构建 FAISS 索引并保存"""
     dim = embeddings.shape[1]
     print(f"构建 FAISS 索引 (维度: {dim})...")
+
+    # faiss.normalize_L2 要求 contiguous 的 ndarray
+    # 如果报错，手动 L2 归一化
+    try:
+        faiss.normalize_L2(embeddings)
+    except ValueError:
+        print("faiss.normalize_L2 失败，手动 L2 归一化...")
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        embeddings = embeddings / norms
+
     index = faiss.IndexFlatIP(dim)
-    faiss.normalize_L2(embeddings)
     index.add(embeddings)
     faiss.write_index(index, str(INDEX_PATH))
     print(f"FAISS 索引已保存: {INDEX_PATH}")
@@ -99,6 +130,8 @@ def search(query: str, embedder: Embedder, index: faiss.Index,
            chunks: list[str], top_k: int = 5) -> list[dict]:
     """检索与 query 最相关的文本块"""
     q_vec = embedder.embed([query])
+    if not q_vec.flags["C_CONTIGUOUS"]:
+        q_vec = np.ascontiguousarray(q_vec)
     faiss.normalize_L2(q_vec)
     scores, indices = index.search(q_vec, top_k)
 
@@ -125,7 +158,7 @@ def index_all(raw_dir: Optional[Path] = None):
         return None
 
     print(f"读取 {len(md_files)} 个原始页面...")
-    for md_path in tqdm(md_files, desc="处理页面"):
+    for md_path in md_files:
         text = md_path.read_text(encoding="utf-8")
         chunks = chunk_text(text)
         all_chunks.extend(chunks)
@@ -143,7 +176,6 @@ def index_all(raw_dir: Optional[Path] = None):
 
 if __name__ == "__main__":
     import sys
-    # 先判断是否需要先爬取
     raw_dir = DATA_DIR / "raw"
     md_files = list(raw_dir.glob("*.md"))
     if not md_files:
