@@ -302,7 +302,7 @@ def _html_to_markdown(html: str, page_url: str = "") -> str:
 
 def save_page(page_name: str, text: str, title: str, folder: str):
     """保存页面到 data/raw/{folder}/{page_name}.md"""
-    safe_name = re.sub(r"[^\\w\\-]", "_", page_name)
+    safe_name = re.sub(r"[^\w\-]", "_", page_name)
     dest_dir = RAW_DIR / folder
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / f"{safe_name}.md"
@@ -342,7 +342,7 @@ def crawl_all(delay: float = 1.0):
                 folder_pages += 1
 
                 # 检查是否已经在本地（避免重复爬）
-                safe_name = re.sub(r"[^\\w\\-]", "_", page_name)
+                safe_name = re.sub(r"[^\w\-]", "_", page_name)
                 local_path = RAW_DIR / folder / f"{safe_name}.md"
                 if local_path.exists():
                     print(f"  ⏭ 已存在: {page_name}")
@@ -373,7 +373,7 @@ def crawl_all(delay: float = 1.0):
                 total += 1
                 folder_pages += 1
 
-                safe_name = re.sub(r"[^\\w\\-]", "_", page_name)
+                safe_name = re.sub(r"[^\w\-]", "_", page_name)
                 local_path = RAW_DIR / folder / f"{safe_name}.md"
                 if local_path.exists():
                     print(f"  ⏭ 已存在: {page_name}")

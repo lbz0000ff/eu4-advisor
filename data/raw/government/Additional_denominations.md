@@ -121,7 +121,7 @@ Church power is a system used by various Religions to access their special modif
 
 Church power formula:
 
-Monthly church power gain=Base monarch power⋅0.10⋅(Other modifiers−(1−Religious unity)){\displaystyle {\text{Monthly church power gain}}={\text{Base monarch power}}\cdot 0.10\cdot \left({\text{Other modifiers}}-(1-{\text{Religious unity}})\right)}
+Failed to parse (SVG (MathML can be enabled via browser plugin): Invalid response ("Math extension cannot connect to Restbase.") from server "https://en.wikipedia.org/api/rest_v1/":): {\displaystyle \text{Monthly church power gain} = \text{Base monarch power} \cdot 0.10 \cdot \left(\text{Other modifiers}-(1-\text{Religious unity})\right)}
 
 - Religious unity and other modifiers are displayed as percentages in the game. To use them in the formula, convert them to a multiplier, i.e. divide the percentage by 100 (10% is 0.1 for example).
 - Base monarch power is the amount of monarch power the country gains every month including all bonuses (ruler skills, advisors, power projection bonus, base value).
