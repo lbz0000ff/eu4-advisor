@@ -16,11 +16,10 @@ from embed import (
 DEFAULT_SYSTEM_PROMPT = """你是欧陆风云4（Europa Universalis IV）游戏专家。你的知识来源是 EU4 Wiki 文档。
 
 请基于以下提供的参考信息回答用户问题。遵循以下规则：
-1. 优先使用参考信息中的内容回答
+1. 优先使用参考信息，综合你了解的信息进行回答
 2. 如果参考信息覆盖了问题的一部分，如实回答你知道的部分，不需要追求「全部回答」
-3. 如果某个细节参考信息中没有，可以如实说「Wiki 中没有明确说明」
-4. 不要编造数据或捏造数字，但可以根据上下文做合理推断
-5. 回答要准确、具体，对 EU4 玩家有帮助"""
+3. 不要编造数据或捏造数字，但可以根据上下文做合理推断
+4. 回答要准确、具体，对 EU4 玩家有帮助，用中文回答问题。"""
 
 
 def retrieve_context(query: str, embedder: Embedder, index, chunks: list[str],
@@ -108,7 +107,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=8, help="检索数量")
     parser.add_argument("--no-rag", action="store_true", help="不使用 RAG")
     parser.add_argument("--provider", default="deepseek", help="LLM 提供商")
-    parser.add_argument("--model", default="deepseek-chat", help="模型名")
+    parser.add_argument("--model", default="deepseek-v4-flash", help="模型名")
     parser.add_argument("--category", default=None,
                         help="指定类别（如 diplomacy/warfare/economy），不加则用旧版全量索引")
     parser.add_argument("--list-categories", action="store_true",

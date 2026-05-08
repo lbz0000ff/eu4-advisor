@@ -91,7 +91,8 @@ class Embedder:
 
     def embed(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
         """批量 embedding，返回完全标准、独立的 float32 二维数组"""
-        print(f"  Embedding {len(texts)} 个文本块...")
+        tag = "查询" if len(texts) <= 3 else "文本块"
+        print(f"  Embedding {len(texts)} 个{tag}...")
         raw_vectors = list(self.model.embed(texts, batch_size=batch_size))
         pure_lists = [v.tolist() for v in raw_vectors]
         embeddings = np.array(pure_lists, dtype=np.float32)
@@ -109,7 +110,6 @@ def build_index(embeddings: np.ndarray, output_path: Optional[Path] = None) -> f
     try:
         faiss.normalize_L2(embeddings)
     except ValueError:
-        print("  faiss.normalize_L2 失败，手动 L2 归一化...")
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1, norms)
         embeddings = embeddings / norms

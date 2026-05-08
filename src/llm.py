@@ -9,7 +9,7 @@ from openai import OpenAI
 @dataclass
 class LLMConfig:
     provider: str = "deepseek"          # "deepseek" | "siliconflow"
-    model: str = "deepseek-chat"        # deepseek-chat / Qwen/Qwen3.5-4B
+    model: str = "deepseek-v4-flash"        # deepseek-chat / Qwen/Qwen3.5-4B
     temperature: float = 0.3
     max_tokens: int = 1024
     base_urls: dict = field(default_factory=lambda: {
