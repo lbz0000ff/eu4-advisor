@@ -1,8 +1,10 @@
 # 一个用于检索《欧陆风云4》wiki的RAG问答系统
 
 ## 运行
+创建api_key.txt然后把deepseek api key填进去
 ```bash
 pip install -r requirements.txt
+
 python src/rag.py
 ```
 
