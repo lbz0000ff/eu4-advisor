@@ -1,4 +1,4 @@
-# Eu4RAG — EU4 Wiki 检索增强问答系统
+# OiratRAG — EU4 Wiki 检索增强问答系统
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
