@@ -1,5 +1,56 @@
+# ── 密钥 ──
 api_key.txt
+.env
+
+# ── Python ──
 __pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ── IDE / 编辑器 ──
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── API 密钥 / 本地配置 ──
+.claude/settings.local.json
+
+# ── 旧测试文件 / 临时调试脚本 ──
+test/*
+src/debug_*.py
+src/test_*.py
+src/check_*.py
+src/merge_index.py
+
+# ── 评测输出 ──
 answers.*
-debug_html.py
-test_crawler.py
+
+# ── 生成的数据（重建索引时不保留） ──
+data/categories/
+data/chunks.json
+data/faiss.index
+data/data-bak/
+
+# ── 索引文件（每次 rerun embed.py 后重建） ──
+data/index/
+data/chunks/
+data/data_normalized/
+
+# ── 原始 Wiki 页面（爬取产生，版权归 Paradox） ──
+data/raw/
+data/raw_data/
+
+# ── Python 缓存 ──
+src/__pycache__/
+
+# ── 不忽略 README ──
+*.md
+!README.md

@@ -8,20 +8,32 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from rag import answer
-from embed import Embedder, load_index, load_chunks, list_categories, search
+from rag import answer, hybrid_search, chunks
+from embed import Embedder
 from llm import LLMConfig, chat
+import faiss
 
-queries = [
-    "What is Prussia?",
-    "How to form Germany?",
-    "What will happen if Ottomans take Constantinople?",
-    "What will happen if Austria form a personal union with Burgundy?",
-    "How to form Great Britain?",
-    "How to form Italy?",
-    "How to form Spain?",
-    "What will cause the Thirty Years' War?",
-]
+EVAL_FILE = Path(__file__).parent.parent / "eval" / "queries.json"
+
+def load_queries():
+    """从 eval/queries.json 加载评测集，支持 --sample 和 --lang 过滤"""
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample", type=int, default=0, help="只跑前 N 条")
+    parser.add_argument("--lang", default="", choices=["en", "zh", ""], help="按语言过滤")
+    args, _ = parser.parse_known_args()
+
+    with open(EVAL_FILE, encoding="utf-8") as f:
+        all_qs = json.load(f)
+    filtered = all_qs
+    if args.lang:
+        filtered = [q for q in filtered if q["lang"] == args.lang]
+    if args.sample:
+        filtered = filtered[:args.sample]
+    # 兼容旧格式：只取 query 文本
+    queries = [q["q"] for q in filtered]
+    print(f"评测集: {len(filtered)} 条 (共 {len(all_qs)} 条) | 语言过滤: {args.lang or '全部'}")
+    return queries
 
 TOP_K = 8
 CALL_DELAY = 0.5  # 每次 API 调用后等待秒数，避免 rate limit
@@ -87,34 +99,8 @@ def judge_json(prompt: str, max_tokens: int = 512) -> dict:
 def load_best_index():
     embedder = Embedder()
     _ = embedder.model
-
-    data_dir = Path(__file__).parent.parent / "data"
-    if (data_dir / "faiss.index").exists():
-        print("加载全局 FAISS 索引...")
-        index = load_index()
-        print("加载全局文本块...")
-        chunks = load_chunks()
-    else:
-        print("全局索引不存在，合并类别索引...")
-        import faiss
-        import numpy as np
-        from embed import load_category_chunks, load_category_index
-
-        cat_info = list_categories()
-        if not cat_info:
-            raise RuntimeError("没有可用索引！请先运行 python3 src/embed.py")
-        all_chunks = []
-        for cat in sorted(cat_info.keys()):
-            all_chunks.extend(load_category_chunks(cat))
-        print(f"重新嵌入 {len(all_chunks)} 个文本块...")
-        embeddings = embedder.embed(all_chunks)
-        dim = embeddings.shape[1]
-        embeddings = np.array(embeddings.tolist(), dtype=np.float32)
-        faiss.normalize_L2(embeddings)
-        index = faiss.IndexFlatIP(dim)
-        index.add(embeddings)
-        chunks = all_chunks
-
+    index = faiss.read_index(str(Path(__file__).parent.parent / "data/index/global.faiss"))
+    print(f"  索引: {index.ntotal} 向量")
     return embedder, index, chunks
 
 
@@ -256,19 +242,23 @@ AI 回答: {answer_text}
 
 def run_all():
     embedder, index, chunks = load_best_index()
+    query_list = load_queries()
+    if not query_list:
+        print("❌ 没有匹配的评测查询，请检查 eval/queries.json")
+        return
     print(f"✅ 就绪！共 {len(chunks)} 个文本块\n")
 
     llm_cfg = LLMConfig()
     results = []
 
-    for i, q in enumerate(queries, 1):
+    for i, q in enumerate(query_list, 1):
         print(f"\n{'='*60}")
-        print(f"[{i}/{len(queries)}] 问题: {q}")
+        print(f"[{i}/{len(query_list)}] 问题: {q}")
         print(f"{'='*60}")
 
         # ── 1. 检索 ──
         print("  → 检索...")
-        raw_results = search(q, embedder, index, chunks, top_k=TOP_K)
+        raw_results = hybrid_search(q, embedder, index, top_k=TOP_K)
         retrieved_texts = [r["text"] for r in raw_results]
 
         # ── 2. 检索质量评估（合并为 1 次调用） ──
@@ -285,7 +275,7 @@ def run_all():
         time.sleep(CALL_DELAY)
         print("  → 带 RAG 回答...")
         answer_rag = answer(
-            q, embedder=embedder, index=index, chunks=chunks, llm_config=llm_cfg,
+            q, embedder=embedder, faiss_index=index, llm_config=llm_cfg,
         )
 
         # ── 4. 生成质量评估 ──
