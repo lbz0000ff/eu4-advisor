@@ -3,6 +3,7 @@ cloudscraper==1.2.71
 faiss-cpu>=1.8.0
 gradio==6.16.0
 langchain-text-splitters>=1.1.0
+langgraph>=1.2,<2.0
 nltk==3.9.4
 numpy==2.4.6
 openai==2.41.0
