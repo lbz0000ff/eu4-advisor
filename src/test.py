@@ -483,40 +483,6 @@ relevancy_score 必须在 0.0 到 1.0 之间。"""
     }
 
 
-def generate_rag_answer(
-    query: str,
-    retrieved_results: list[dict],
-    llm_config: LLMConfig,
-    max_attempts: int = 2,
-) -> dict[str, Any]:
-    last_error = "empty_response"
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = answer(
-                query,
-                llm_config=llm_config,
-                retrieved_results=retrieved_results,
-            )
-            if response and response.strip():
-                return {
-                    "text": response.strip(),
-                    "status": "ok",
-                    "attempts": attempt,
-                    "failure_reason": "",
-                }
-            last_error = "empty_response"
-        except Exception as error:
-            last_error = f"{type(error).__name__}: {error}"
-        if attempt < max_attempts:
-            time.sleep(1)
-    return {
-        "text": "",
-        "status": "failed",
-        "attempts": max_attempts,
-        "failure_reason": last_error,
-    }
-
-
 def generate_no_rag_answer(
     query: str,
     llm_config: LLMConfig,
@@ -622,8 +588,61 @@ def _format_score(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.3f}"
 
 
+def _failed_metrics(failure_reason: str) -> dict[str, dict[str, Any]]:
+    return {
+        "contextual_precision": _invalid_metric(failure_reason),
+        "contextual_recall": _invalid_metric(failure_reason),
+        "faithfulness": _invalid_metric(failure_reason),
+        "answer_relevancy": _invalid_metric(failure_reason),
+    }
+
+
+def agentic_failure_metrics() -> dict[str, dict[str, Any]]:
+    return _failed_metrics("agentic_rag_failed")
+
+
 def run_agentic_question(graph, query: str) -> dict[str, Any]:
-    return graph.invoke({"original_query": query}, config={"recursion_limit": 10})
+    try:
+        return graph.invoke({"original_query": query}, config={"recursion_limit": 10})
+    except Exception as error:
+        error_type = type(error).__name__
+        error_message = str(error)
+        return {
+            "answer": "",
+            "retrieved_results": [],
+            "trace": {
+                "plans": [],
+                "retrievals": [],
+                "coverage": [],
+                "failure": {"type": error_type, "message": error_message},
+            },
+            "failure_reason": f"{error_type}: {error_message}",
+        }
+
+
+def generation_status_from_agentic_state(state: dict[str, Any]) -> dict[str, Any]:
+    answer_text = state.get("answer", "")
+    failure_reason = str(state.get("failure_reason", ""))
+    if failure_reason:
+        return {
+            "text": answer_text if isinstance(answer_text, str) else "",
+            "attempts": 1,
+            "status": "failed",
+            "failure_reason": failure_reason,
+        }
+    if not isinstance(answer_text, str) or not answer_text.strip():
+        return {
+            "text": "",
+            "attempts": 1,
+            "status": "failed",
+            "failure_reason": "empty_answer",
+        }
+    return {
+        "text": answer_text,
+        "attempts": 1,
+        "status": "ok",
+        "failure_reason": "",
+    }
 
 
 def run_all() -> None:
@@ -692,15 +711,27 @@ def run_all() -> None:
         agentic_state = run_agentic_question(agentic_graph, query)
         retrieved = agentic_state["retrieved_results"]
         retrieved_texts = [item["text"] for item in retrieved]
-        answer_rag = agentic_state["answer"]
-        generated = {"text": answer_rag, "attempts": 1, "status": "ok"}
+        generated = generation_status_from_agentic_state(agentic_state)
+        answer_rag = generated["text"]
 
-        time.sleep(args.call_delay)
-        print("  -> 评估检索精确率...")
-        precision = eval_contextual_precision(query, retrieved, judge_config)
-        time.sleep(args.call_delay)
-        print("  -> 评估检索覆盖度...")
-        recall = eval_contextual_recall(query, retrieved_texts, judge_config)
+        if generated["status"] == "failed":
+            failure_reason = (
+                "agentic_rag_failed"
+                if agentic_state.get("failure_reason")
+                else generated["failure_reason"]
+            )
+            metrics = _failed_metrics(failure_reason)
+            precision = metrics["contextual_precision"]
+            recall = metrics["contextual_recall"]
+            faithfulness = metrics["faithfulness"]
+            relevancy = metrics["answer_relevancy"]
+        else:
+            time.sleep(args.call_delay)
+            print("  -> 评估检索精确率...")
+            precision = eval_contextual_precision(query, retrieved, judge_config)
+            time.sleep(args.call_delay)
+            print("  -> 评估检索覆盖度...")
+            recall = eval_contextual_recall(query, retrieved_texts, judge_config)
 
         no_rag = None
         if args.include_no_rag:
@@ -712,11 +743,12 @@ def run_all() -> None:
                 max_attempts=args.generation_attempts,
             )
 
-        time.sleep(args.call_delay)
-        print("  -> 评估生成质量...")
-        faithfulness = eval_faithfulness(answer_rag, retrieved_texts, judge_config)
-        time.sleep(args.call_delay)
-        relevancy = eval_answer_relevancy(query, answer_rag, judge_config)
+        if generated["status"] == "ok":
+            time.sleep(args.call_delay)
+            print("  -> 评估生成质量...")
+            faithfulness = eval_faithfulness(answer_rag, retrieved_texts, judge_config)
+            time.sleep(args.call_delay)
+            relevancy = eval_answer_relevancy(query, answer_rag, judge_config)
 
         entry = {
             "query_id": query_item.get("id"),

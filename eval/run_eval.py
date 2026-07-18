@@ -1,7 +1,7 @@
 """
-Agentic RAG 运行报告 — 自动跑中英文查询，输出回答、检索上下文与决策轨迹。
+Agentic RAG 运行报告 — 自动跑中英文查询，保存回答、检索摘要与决策轨迹。
 用法:
-    python eval/run_eval.py                     # 跑全部 50 条
+    python eval/run_eval.py                     # 跑全部 60 条
     python eval/run_eval.py --rerank            # 带 Cross-Encoder 重排
     python eval/run_eval.py --sample 10          # 只跑前 10 条
     python eval/run_eval.py --lang zh            # 只跑中文

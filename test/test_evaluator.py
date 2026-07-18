@@ -60,6 +60,40 @@ class AgenticEvaluationTest(unittest.TestCase):
         self.assertEqual(result["retrieved_results"][0]["text"], "context")
         self.assertEqual(result["trace"]["plans"], [])
 
+    def test_graph_failure_returns_auditable_state_without_retry(self) -> None:
+        graph = unittest.mock.MagicMock()
+        graph.invoke.side_effect = RuntimeError("planner unavailable")
+
+        result = evaluator.run_agentic_question(graph, "query")
+
+        graph.invoke.assert_called_once_with(
+            {"original_query": "query"},
+            config={"recursion_limit": 10},
+        )
+        self.assertEqual(result["answer"], "")
+        self.assertEqual(result["retrieved_results"], [])
+        self.assertEqual(result["failure_reason"], "RuntimeError: planner unavailable")
+        self.assertEqual(
+            result["trace"]["failure"],
+            {"type": "RuntimeError", "message": "planner unavailable"},
+        )
+
+    def test_empty_agentic_answer_is_a_failed_generation(self) -> None:
+        status = evaluator.generation_status_from_agentic_state({"answer": ""})
+
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["failure_reason"], "empty_answer")
+
+    def test_agentic_failure_metrics_are_invalid(self) -> None:
+        metrics = evaluator.agentic_failure_metrics()
+
+        self.assertFalse(metrics["contextual_precision"]["valid"])
+        self.assertIsNone(metrics["contextual_precision"]["score"])
+        self.assertEqual(
+            metrics["answer_relevancy"]["failure_reason"],
+            "agentic_rag_failed",
+        )
+
 
 class JudgeParsingTest(unittest.TestCase):
     def test_judge_defaults_to_linar_uuapi_gpt_5_5(self) -> None:
@@ -127,22 +161,18 @@ class MetricEvaluationTest(unittest.TestCase):
         self.assertEqual(result["failure_reason"], "empty_answer")
 
 
-class GenerationTest(unittest.TestCase):
-    def test_generate_rag_answer_retries_empty_response(self) -> None:
-        retrieved = [{"text": "context"}]
+class SummaryTest(unittest.TestCase):
+    def test_summarize_does_not_count_failed_agentic_generation(self) -> None:
+        summary = evaluator.summarize(
+            [
+                {"generation_status": {"status": "ok"}, "answer_rag": "answer"},
+                {"generation_status": {"status": "failed"}, "answer_rag": ""},
+            ]
+        )
 
-        with patch.object(evaluator, "answer", side_effect=["", "final answer"]) as answer:
-            result = evaluator.generate_rag_answer(
-                "query",
-                retrieved,
-                evaluator.LLMConfig(model="generator"),
-                max_attempts=2,
-            )
-
-        self.assertEqual(result["text"], "final answer")
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(result["status"], "ok")
-        self.assertIs(answer.call_args.kwargs["retrieved_results"], retrieved)
+        self.assertEqual(summary["answers"]["generated"], 1)
+        self.assertEqual(summary["answers"]["failed"], 1)
+        self.assertEqual(summary["answers"]["total"], 2)
 
 
 if __name__ == "__main__":
