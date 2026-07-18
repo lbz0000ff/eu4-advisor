@@ -7,7 +7,7 @@ import gradio as gr
 import faiss
 
 # rag.py 在顶层加载 chunks 和 parent_tables
-from rag import answer, hybrid_search, chunks
+from rag import build_agentic_runtime, chunks
 from embed import Embedder
 from llm import LLMConfig
 from reranker import get_reranker
@@ -42,18 +42,20 @@ def query_fn(question: str, category: str, top_k: int, use_rerank: bool):
     llm_cfg = LLMConfig()
     reranker = get_reranker() if use_rerank else None
 
-    # 检索
-    results = hybrid_search(
-        question, embedder, faiss_index,
-        top_k=top_k, category=category, reranker=reranker,
-    )
-
-    # 生成
-    llm_answer = answer(
-        question, embedder=embedder, faiss_index=faiss_index,
-        category=category, top_k=top_k, llm_config=llm_cfg,
+    agentic_graph = build_agentic_runtime(
+        embedder,
+        faiss_index,
         reranker=reranker,
+        category=category,
+        top_k=top_k,
+        llm_config=llm_cfg,
     )
+    state = agentic_graph.invoke(
+        {"original_query": question},
+        config={"recursion_limit": 10},
+    )
+    results = state["retrieved_results"]
+    llm_answer = state["answer"]
 
     # 格式化检索明细
     details = ""

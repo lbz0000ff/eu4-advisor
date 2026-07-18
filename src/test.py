@@ -1,297 +1,738 @@
-"""RAG 评测脚本 - 对比模式 + 检索/生成质量评估"""
+"""RAG evaluation with auditable retrieval and LLM-as-Judge outputs."""
 
+import argparse
 import json
+import os
 import re
-import time
-from pathlib import Path
 import sys
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
+import faiss
+from dotenv import load_dotenv
+
+
+ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
+load_dotenv(ROOT / ".env")
 
-from rag import answer, hybrid_search, chunks
 from embed import Embedder
 from llm import LLMConfig, chat
-import faiss
+from rag import answer, build_agentic_runtime, chunks
+from reranker import get_reranker
 
-EVAL_FILE = Path(__file__).parent.parent / "eval" / "queries.json"
 
-def load_queries():
-    """从 eval/queries.json 加载评测集，支持 --sample 和 --lang 过滤"""
-    import argparse
+EVAL_FILE = ROOT / "eval" / "queries.json"
+DEFAULT_OUTPUT = ROOT / "answers.json"
+TOP_K = 8
+CALL_DELAY = 0.5
+
+EU4_CONTEXT = """注意：所有用户问题都是关于《欧陆风云4》（Europa Universalis IV）这款游戏的，不是现实历史。
+例如 "What is Prussia?" 问的是游戏中的普鲁士（可玩国家/可成立国家），不是现实中的普鲁士王国。
+请始终以游戏机制、游戏内容的角度判断相关性。"""
+
+ABSTENTION_ANSWERS = {
+    "知识库中未找到相关信息",
+    "未找到相关信息",
+    "no relevant information was found in the knowledge base",
+    "no relevant information found",
+}
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=int, default=0, help="只跑前 N 条")
     parser.add_argument("--lang", default="", choices=["en", "zh", ""], help="按语言过滤")
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--include-no-rag", action="store_true", help="额外生成无 RAG 对照回答")
+    parser.add_argument("--generation-attempts", type=int, default=2, help="空回答或异常时的生成尝试次数")
+    parser.add_argument("--call-delay", type=float, default=CALL_DELAY, help="模型调用间隔秒数")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="结果 JSON 路径")
+    return parser.parse_args()
 
-    with open(EVAL_FILE, encoding="utf-8") as f:
-        all_qs = json.load(f)
-    filtered = all_qs
+
+def load_queries(args: argparse.Namespace | None = None) -> list[dict[str, Any]]:
+    if args is None:
+        args = parse_args()
+    with EVAL_FILE.open(encoding="utf-8") as file:
+        queries = json.load(file)
     if args.lang:
-        filtered = [q for q in filtered if q["lang"] == args.lang]
+        queries = [item for item in queries if item["lang"] == args.lang]
     if args.sample:
-        filtered = filtered[:args.sample]
-    # 兼容旧格式：只取 query 文本
-    queries = [q["q"] for q in filtered]
-    print(f"评测集: {len(filtered)} 条 (共 {len(all_qs)} 条) | 语言过滤: {args.lang or '全部'}")
+        queries = queries[: args.sample]
+    print(
+        f"评测集: {len(queries)} 条 | "
+        f"语言过滤: {args.lang or '全部'}"
+    )
     return queries
 
-TOP_K = 8
-CALL_DELAY = 0.5  # 每次 API 调用后等待秒数，避免 rate limit
 
-# ── LLM-as-Judge 配置 ──
-EU4_CONTEXT = """注意：所有用户问题都是关于《欧陆风云4》（Europa Universalis IV）这款游戏的，不是现实历史。
-例如 "What is Prussia?" 问的是游戏中的普鲁士（可玩国家/可成立国家），不是现实中的普鲁士王国。
-请始终以游戏机制、游戏内容的角度来判断相关性，而非现实历史。"""
-
-
-def judge_call(prompt: str, max_tokens: int = 512) -> str:
-    """调用 LLM，带重试"""
-    cfg = LLMConfig(temperature=0.0, max_tokens=max_tokens)
-    for attempt in range(3):
-        try:
-            resp = chat(
-                messages=[{"role": "user", "content": prompt}],
-                config=cfg,
-            )
-            if resp and resp.strip():
-                return resp
-        except Exception as e:
-            pass
-        # 重试前等待
-        time.sleep(2 ** attempt)
-    return ""
+def build_generator_config() -> LLMConfig:
+    return LLMConfig(
+        model=os.environ.get("LLM_MODEL", "deepseek-chat"),
+        base_url=os.environ.get("LLM_BASE_URL", ""),
+        api_key=os.environ.get("LLM_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", ""),
+        temperature=0.3,
+        max_tokens=1024,
+    )
 
 
-def extract_json(raw: str) -> dict | None:
-    if not raw or not raw.strip():
-        return None
-    text = raw.strip()
-    # 去 ```json 标记
-    cleaned = re.sub(r"```(?:json)?", "", text).strip()
-    # 找 {} 对
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError:
-            pass
-    # 直接尝试
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # 搜数字
-    nums = re.findall(r"(\d+\.?\d*)", text)
-    if nums:
-        return {"score": float(nums[0])}
-    return None
+def build_judge_config() -> LLMConfig:
+    judge_api_key = (
+        os.environ.get("JUDGE_API_KEY", "")
+        or os.environ.get("UUAPI_API_KEY", "")
+    )
+    if not judge_api_key:
+        raise ValueError("未设置 JUDGE_API_KEY 或 UUAPI_API_KEY")
+    return LLMConfig(
+        model=(
+            os.environ.get("JUDGE_MODEL", "")
+            or os.environ.get("RACE_MODEL", "")
+            or "gpt-5.5"
+        ),
+        base_url=(
+            os.environ.get("JUDGE_BASE_URL", "")
+            or os.environ.get("UUAPI_BASE_URL", "")
+            or "https://uuapi.net/v1"
+        ).rstrip("/"),
+        api_key=judge_api_key,
+        temperature=0.0,
+        max_tokens=1024,
+    )
 
 
-def judge_json(prompt: str, max_tokens: int = 512) -> dict:
-    raw = judge_call(prompt, max_tokens=max_tokens)
-    result = extract_json(raw)
-    if result is not None:
-        return result
-    return {"_parse_failed": True, "_raw": raw[:500]}
-
-
-def load_best_index():
-    embedder = Embedder()
-    _ = embedder.model
-    index = faiss.read_index(str(Path(__file__).parent.parent / "data/index/global.faiss"))
-    print(f"  索引: {index.ntotal} 向量")
-    return embedder, index, chunks
-
-
-# ═══════════════════════════════════════
-# 检索质量指标
-# ═══════════════════════════════════════
-
-def eval_contextual_precision(query: str, retrieved_chunks: list[dict]) -> dict:
-    """逐个 chunk 判相关，带回退重试（每次调用间有间隔）"""
-    if not retrieved_chunks:
-        return {"score": 0.0, "details": "无检索结果"}
-
-    relevant_count = 0
-    mapped = []
-
-    for i, r in enumerate(retrieved_chunks[:TOP_K]):
-        chunk_text = r["text"][:500]
-        prompt = f"""{EU4_CONTEXT}
-
-判断以下文档块是否与用户问题相关。只输出 JSON。
-
-用户问题: {query}
-
-文档块: {chunk_text}
-
-{{"relevant": true/false, "reason": "一句话理由"}}"""
-        result = judge_json(prompt)
-        if result.get("_parse_failed"):
-            # 单次失败先用 False 占位
-            mapped.append({
-                "rank": i + 1,
-                "score": round(r["score"], 4),
-                "relevant": False,
-                "reason": "judge 解析失败",
-                "_raw": result.get("_raw", ""),
-            })
-        else:
-            is_rel = result.get("relevant", False)
-            if is_rel:
-                relevant_count += 1
-            mapped.append({
-                "rank": i + 1,
-                "score": round(r["score"], 4),
-                "relevant": is_rel,
-                "reason": result.get("reason", ""),
-            })
-
-        # 每个 chunk 之间等一会
-        time.sleep(CALL_DELAY)
-
-    precision = relevant_count / TOP_K
+def config_metadata(config: LLMConfig) -> dict[str, Any]:
     return {
-        "score": round(precision, 4),
-        "relevant_chunks": relevant_count,
-        "total": TOP_K,
-        "chunk_judgments": mapped,
+        "model": config.model,
+        "base_url": config.base_url,
+        "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
     }
 
 
-def eval_contextual_recall(query: str, all_chunk_texts: list[str]) -> dict:
-    if not all_chunk_texts:
-        return {"score": 0.0}
-    combined = "\n\n---\n\n".join(t[:800] for t in all_chunk_texts[:TOP_K])
+def judge_call(
+    prompt: str,
+    max_tokens: int = 512,
+    config: LLMConfig | None = None,
+) -> tuple[str, str, int]:
+    """Call the judge and retain the final error instead of swallowing it."""
+    base_config = config or build_judge_config()
+    call_config = replace(base_config, temperature=0.0, max_tokens=max_tokens)
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            response = chat(
+                messages=[{"role": "user", "content": prompt}],
+                config=call_config,
+            )
+            if response and response.strip():
+                return response.strip(), "", attempt
+            last_error = "empty_judge_response"
+        except Exception as error:
+            last_error = f"{type(error).__name__}: {error}"
+        if attempt < 3:
+            time.sleep(2 ** (attempt - 1))
+    return "", last_error, 3
+
+
+def extract_json(raw: str) -> dict[str, Any] | None:
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        result = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _matches_type(value: Any, expected: type | tuple[type, ...]) -> bool:
+    if isinstance(value, bool) and expected in ((int, float), (float, int)):
+        return False
+    return isinstance(value, expected)
+
+
+def judge_json(
+    prompt: str,
+    required_fields: dict[str, type | tuple[type, ...]],
+    max_tokens: int = 512,
+    config: LLMConfig | None = None,
+) -> dict[str, Any]:
+    raw, call_error, attempts = judge_call(prompt, max_tokens=max_tokens, config=config)
+    metadata = {
+        "_judge_raw": raw,
+        "_judge_attempts": attempts,
+    }
+    if call_error:
+        return {
+            **metadata,
+            "_judge_failed": True,
+            "_failure_reason": call_error,
+        }
+    result = extract_json(raw)
+    if result is None:
+        return {
+            **metadata,
+            "_judge_failed": True,
+            "_failure_reason": "invalid_json",
+        }
+    for field, expected_type in required_fields.items():
+        if field not in result:
+            return {
+                **metadata,
+                "_judge_failed": True,
+                "_failure_reason": f"missing_field:{field}",
+            }
+        if not _matches_type(result[field], expected_type):
+            return {
+                **metadata,
+                "_judge_failed": True,
+                "_failure_reason": f"invalid_type:{field}",
+            }
+    return {**result, **metadata}
+
+
+def _judge_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "_judge_raw": result.get("_judge_raw", ""),
+        "_judge_attempts": result.get("_judge_attempts", 0),
+    }
+
+
+def _invalid_metric(
+    reason: str,
+    judge_result: dict[str, Any] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    result = {
+        "score": None,
+        "valid": False,
+        "failure_reason": reason,
+        **extra,
+    }
+    if judge_result is not None:
+        result.update(_judge_metadata(judge_result))
+    return result
+
+
+def _valid_score(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    score = float(value)
+    return score if 0.0 <= score <= 1.0 else None
+
+
+def load_components():
+    embedder = Embedder()
+    _ = embedder.model
+    index = faiss.read_index(str(ROOT / "data" / "index" / "global.faiss"))
+    reranker = get_reranker()
+    _ = reranker.model
+    print(f"  索引: {index.ntotal} 向量")
+    return embedder, index, reranker
+
+
+def eval_contextual_precision(
+    query: str,
+    retrieved_chunks: list[dict],
+    judge_config: LLMConfig | None = None,
+) -> dict[str, Any]:
+    selected = retrieved_chunks[:TOP_K]
+    if not selected:
+        return {
+            "score": 0.0,
+            "valid": True,
+            "relevant_chunks": 0,
+            "total": 0,
+            "chunk_judgments": [],
+            "evaluation_mode": "deterministic_empty_retrieval",
+        }
+
+    documents = "\n\n".join(
+        f"[{rank}] {item['text']}"
+        for rank, item in enumerate(selected, 1)
+    )
     prompt = f"""{EU4_CONTEXT}
 
-判断以下检索内容是否包含足够信息回答用户问题。只输出 JSON。
+判断每个检索块是否与用户问题相关。必须为每个编号返回一项，且只输出 JSON。
 
-用户问题: {query}
+用户问题:
+{query}
+
+检索块:
+{documents}
+
+输出格式:
+{{"judgments":[{{"rank":1,"relevant":true,"reason":"一句话理由"}}]}}"""
+    judged = judge_json(
+        prompt,
+        required_fields={"judgments": list},
+        max_tokens=1536,
+        config=judge_config,
+    )
+    if judged.get("_judge_failed"):
+        return _invalid_metric(
+            judged["_failure_reason"],
+            judged,
+            relevant_chunks=None,
+            total=len(selected),
+            chunk_judgments=[],
+        )
+
+    judgments = judged["judgments"]
+    if len(judgments) != len(selected):
+        return _invalid_metric(
+            "judgment_count_mismatch",
+            judged,
+            relevant_chunks=None,
+            total=len(selected),
+            chunk_judgments=[],
+        )
+
+    by_rank: dict[int, dict[str, Any]] = {}
+    for item in judgments:
+        if not isinstance(item, dict):
+            return _invalid_metric("invalid_judgment_item", judged, total=len(selected))
+        rank = item.get("rank")
+        relevant = item.get("relevant")
+        if not isinstance(rank, int) or not isinstance(relevant, bool):
+            return _invalid_metric("invalid_judgment_schema", judged, total=len(selected))
+        by_rank[rank] = item
+    if set(by_rank) != set(range(1, len(selected) + 1)):
+        return _invalid_metric("invalid_judgment_ranks", judged, total=len(selected))
+
+    mapped = []
+    relevant_count = 0
+    for rank, retrieved in enumerate(selected, 1):
+        item = by_rank[rank]
+        if item["relevant"]:
+            relevant_count += 1
+        mapped.append(
+            {
+                "rank": rank,
+                "score": round(float(retrieved.get("score", 0.0)), 4),
+                "relevant": item["relevant"],
+                "reason": str(item.get("reason", "")),
+            }
+        )
+    return {
+        "score": round(relevant_count / len(selected), 4),
+        "valid": True,
+        "relevant_chunks": relevant_count,
+        "total": len(selected),
+        "chunk_judgments": mapped,
+        **_judge_metadata(judged),
+    }
+
+
+def eval_contextual_recall(
+    query: str,
+    all_chunk_texts: list[str],
+    judge_config: LLMConfig | None = None,
+) -> dict[str, Any]:
+    if not all_chunk_texts:
+        return {
+            "score": 0.0,
+            "valid": True,
+            "reason": "无检索结果",
+            "evaluation_mode": "deterministic_empty_retrieval",
+        }
+    combined = "\n\n---\n\n".join(all_chunk_texts[:TOP_K])
+    prompt = f"""{EU4_CONTEXT}
+
+判断检索内容是否包含足够信息回答用户问题。只输出 JSON。
+
+用户问题:
+{query}
 
 检索内容:
 {combined}
 
-{{"score": 0.0~1.0, "reason": "一句话"}}
-1.0=完全覆盖  0.6=部分覆盖  0.3=基本没覆盖"""
-    result = judge_json(prompt)
-    if result.get("_parse_failed"):
-        return {"score": 0.0, "reason": "judge 响应无法解析", "_raw": result.get("_raw", "")}
+输出格式:
+{{"score":0.0,"reason":"一句话理由"}}
+score 必须在 0.0 到 1.0 之间。"""
+    judged = judge_json(
+        prompt,
+        required_fields={"score": (int, float), "reason": str},
+        config=judge_config,
+    )
+    if judged.get("_judge_failed"):
+        return _invalid_metric(judged["_failure_reason"], judged)
+    score = _valid_score(judged["score"])
+    if score is None:
+        return _invalid_metric("score_out_of_range", judged)
     return {
-        "score": round(float(result.get("score", 0)), 4),
-        "reason": result.get("reason", ""),
+        "score": round(score, 4),
+        "valid": True,
+        "reason": judged["reason"],
+        **_judge_metadata(judged),
     }
 
 
-# ═══════════════════════════════════════
-# 生成质量指标
-# ═══════════════════════════════════════
+def _normalized_answer(answer_text: str) -> str:
+    return re.sub(r"[\s。.!！]+$", "", answer_text.strip().lower())
 
-def eval_faithfulness(answer_text: str, chunk_texts: list[str]) -> dict:
-    context_snippet = "\n\n---\n\n".join(t[:800] for t in chunk_texts[:TOP_K])
-    prompt = f"""判断 AI 回答是否完全基于所提供的上下文（无幻觉）。只输出 JSON，不要任何额外文字。
+
+def is_abstention(answer_text: str) -> bool:
+    return _normalized_answer(answer_text) in ABSTENTION_ANSWERS
+
+
+def eval_faithfulness(
+    answer_text: str,
+    chunk_texts: list[str],
+    judge_config: LLMConfig | None = None,
+) -> dict[str, Any]:
+    if not answer_text or not answer_text.strip():
+        return _invalid_metric("empty_answer")
+    if is_abstention(answer_text):
+        return _invalid_metric("abstained")
+    if not chunk_texts:
+        return _invalid_metric("missing_context")
+
+    context = "\n\n---\n\n".join(chunk_texts[:TOP_K])
+    prompt = f"""判断 AI 回答是否完全基于所提供的上下文。只输出 JSON。
 
 上下文:
-{context_snippet}
+{context}
 
 AI 回答:
 {answer_text}
 
-{{"faithfulness_score": 0.0~1.0, "hallucinations": [], "supported_claims": []}}
-1.0=完全忠实  0.7=少量合理推断  0.4=部分幻觉  0.0=大量编造"""
-    result = judge_json(prompt, max_tokens=768)
-    if result.get("_parse_failed"):
-        return {
-            "score": 0.0,
-            "hallucinations": [],
-            "supported_claims": [],
-            "_parse_failed": True,
-            "_raw": result.get("_raw", ""),
-        }
+输出格式:
+{{"faithfulness_score":0.0,"hallucinations":[],"supported_claims":[]}}
+faithfulness_score 必须在 0.0 到 1.0 之间。"""
+    judged = judge_json(
+        prompt,
+        required_fields={
+            "faithfulness_score": (int, float),
+            "hallucinations": list,
+            "supported_claims": list,
+        },
+        max_tokens=1536,
+        config=judge_config,
+    )
+    if judged.get("_judge_failed"):
+        return _invalid_metric(judged["_failure_reason"], judged)
+    score = _valid_score(judged["faithfulness_score"])
+    if score is None:
+        return _invalid_metric("score_out_of_range", judged)
     return {
-        "score": round(float(result.get("faithfulness_score", 0)), 4),
-        "hallucinations": result.get("hallucinations", []),
-        "supported_claims": result.get("supported_claims", []),
+        "score": round(score, 4),
+        "valid": True,
+        "hallucinations": judged["hallucinations"],
+        "supported_claims": judged["supported_claims"],
+        **_judge_metadata(judged),
     }
 
 
-def eval_answer_relevancy(query: str, answer_text: str) -> dict:
+def eval_answer_relevancy(
+    query: str,
+    answer_text: str,
+    judge_config: LLMConfig | None = None,
+) -> dict[str, Any]:
+    if not answer_text or not answer_text.strip():
+        return {
+            "score": 0.0,
+            "valid": True,
+            "reason": "回答为空",
+            "evaluation_mode": "deterministic_empty_answer",
+        }
+    if is_abstention(answer_text):
+        return {
+            "score": 0.0,
+            "valid": True,
+            "reason": "模型拒答或未检索到信息",
+            "evaluation_mode": "deterministic_abstention",
+        }
+
     prompt = f"""{EU4_CONTEXT}
 
 判断 AI 回答是否直接针对用户问题。只输出 JSON。
 
-用户问题: {query}
+用户问题:
+{query}
 
-AI 回答: {answer_text}
+AI 回答:
+{answer_text}
 
-{{"relevancy_score": 0.0~1.0, "reason": "一句话"}}
-1.0=完全针对  0.7=基本针对  0.4=部分跑题  0.0=答非所问"""
-    result = judge_json(prompt)
-    if result.get("_parse_failed"):
-        return {"score": 0.0, "reason": "judge 响应无法解析", "_raw": result.get("_raw", "")}
+输出格式:
+{{"relevancy_score":0.0,"reason":"一句话理由"}}
+relevancy_score 必须在 0.0 到 1.0 之间。"""
+    judged = judge_json(
+        prompt,
+        required_fields={"relevancy_score": (int, float), "reason": str},
+        config=judge_config,
+    )
+    if judged.get("_judge_failed"):
+        return _invalid_metric(judged["_failure_reason"], judged)
+    score = _valid_score(judged["relevancy_score"])
+    if score is None:
+        return _invalid_metric("score_out_of_range", judged)
     return {
-        "score": round(float(result.get("relevancy_score", 0)), 4),
-        "reason": result.get("reason", ""),
+        "score": round(score, 4),
+        "valid": True,
+        "reason": judged["reason"],
+        **_judge_metadata(judged),
     }
 
 
-# ═══════════════════════════════════════
-# 主流程
-# ═══════════════════════════════════════
+def generate_rag_answer(
+    query: str,
+    retrieved_results: list[dict],
+    llm_config: LLMConfig,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    last_error = "empty_response"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = answer(
+                query,
+                llm_config=llm_config,
+                retrieved_results=retrieved_results,
+            )
+            if response and response.strip():
+                return {
+                    "text": response.strip(),
+                    "status": "ok",
+                    "attempts": attempt,
+                    "failure_reason": "",
+                }
+            last_error = "empty_response"
+        except Exception as error:
+            last_error = f"{type(error).__name__}: {error}"
+        if attempt < max_attempts:
+            time.sleep(1)
+    return {
+        "text": "",
+        "status": "failed",
+        "attempts": max_attempts,
+        "failure_reason": last_error,
+    }
 
-def run_all():
-    embedder, index, chunks = load_best_index()
-    query_list = load_queries()
-    if not query_list:
-        print("❌ 没有匹配的评测查询，请检查 eval/queries.json")
+
+def generate_no_rag_answer(
+    query: str,
+    llm_config: LLMConfig,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    last_error = "empty_response"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = answer(query, use_rag=False, llm_config=llm_config)
+            if response and response.strip():
+                return {
+                    "text": response.strip(),
+                    "status": "ok",
+                    "attempts": attempt,
+                    "failure_reason": "",
+                }
+            last_error = "empty_response"
+        except Exception as error:
+            last_error = f"{type(error).__name__}: {error}"
+        if attempt < max_attempts:
+            time.sleep(1)
+    return {
+        "text": "",
+        "status": "failed",
+        "attempts": max_attempts,
+        "failure_reason": last_error,
+    }
+
+
+def _nested_score(item: dict[str, Any], *keys: str) -> float | None:
+    value: Any = item
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
+    metric_paths = {
+        "contextual_precision": ("retrieval_metrics", "contextual_precision", "score"),
+        "contextual_recall": ("retrieval_metrics", "contextual_recall", "score"),
+        "faithfulness": ("generation_metrics", "faithfulness", "score"),
+        "answer_relevancy": ("generation_metrics", "answer_relevancy", "score"),
+    }
+    values: dict[str, list[float]] = {}
+    for name, path in metric_paths.items():
+        values[name] = [
+            score
+            for result in results
+            if (score := _nested_score(result, *path)) is not None
+        ]
+
+    def mean(name: str) -> float | None:
+        scores = values[name]
+        return round(sum(scores) / len(scores), 4) if scores else None
+
+    statuses = [result["generation_status"]["status"] for result in results]
+    answers = [result["answer_rag"] for result in results]
+    return {
+        "retrieval": {
+            "contextual_precision": mean("contextual_precision"),
+            "contextual_recall": mean("contextual_recall"),
+        },
+        "generation": {
+            "faithfulness": mean("faithfulness"),
+            "answer_relevancy": mean("answer_relevancy"),
+        },
+        "valid_counts": {
+            name: {"valid": len(scores), "total": len(results)}
+            for name, scores in values.items()
+        },
+        "answers": {
+            "generated": statuses.count("ok"),
+            "failed": statuses.count("failed"),
+            "abstained": sum(is_abstention(text) for text in answers if text),
+            "total": len(results),
+        },
+    }
+
+
+def write_output(
+    output_path: Path,
+    run_config: dict[str, Any],
+    results: list[dict[str, Any]],
+    complete: bool,
+) -> None:
+    output = {
+        "run_config": {**run_config, "complete": complete},
+        "summary": summarize(results),
+        "results": results,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _format_score(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.3f}"
+
+
+def run_agentic_question(graph, query: str) -> dict[str, Any]:
+    return graph.invoke({"original_query": query}, config={"recursion_limit": 10})
+
+
+def run_all() -> None:
+    args = parse_args()
+    query_items = load_queries(args)
+    if not query_items:
+        print("没有匹配的评测查询，请检查 eval/queries.json")
         return
-    print(f"✅ 就绪！共 {len(chunks)} 个文本块\n")
 
-    llm_cfg = LLMConfig()
-    results = []
+    generator_config = build_generator_config()
+    judge_config = build_judge_config()
+    embedder, index, reranker = load_components()
+    agentic_graph = build_agentic_runtime(
+        embedder,
+        index,
+        reranker=reranker,
+        top_k=TOP_K,
+        llm_config=generator_config,
+    )
+    judge_independent = (
+        generator_config.model != judge_config.model
+        or generator_config.base_url != judge_config.base_url
+    )
+    if not judge_independent:
+        print("警告: 生成模型与 Judge 相同，本次结果不适合作为正式对外分数。")
 
-    for i, q in enumerate(query_list, 1):
-        print(f"\n{'='*60}")
-        print(f"[{i}/{len(query_list)}] 问题: {q}")
-        print(f"{'='*60}")
+    run_config = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "query_count": len(query_items),
+        "question_set": {
+            "path": str(EVAL_FILE),
+            "origin": "project-specific, AI-assisted generation",
+            "standard_benchmark": False,
+            "total_questions": 60,
+            "languages": ["zh", "en"],
+        },
+        "top_k": TOP_K,
+        "call_delay_seconds": args.call_delay,
+        "generator": config_metadata(generator_config),
+        "judge": config_metadata(judge_config),
+        "judge_independent": judge_independent,
+        "embedding_model": embedder.model_name,
+        "reranker_model": reranker.model_name,
+        "retrieval": {
+            "faiss_candidates": TOP_K * 3,
+            "bm25_candidates": TOP_K * 3,
+            "fusion": "RRF",
+            "rerank_top_k": TOP_K,
+        },
+        "agentic_rag": {
+            "framework": "LangGraph",
+            "max_retrieval_rounds": 2,
+            "max_queries_per_round": 3,
+            "decision_format": "tool_calls + Pydantic",
+        },
+    }
+    results: list[dict[str, Any]] = []
 
-        # ── 1. 检索 ──
-        print("  → 检索...")
-        raw_results = hybrid_search(q, embedder, index, top_k=TOP_K)
-        retrieved_texts = [r["text"] for r in raw_results]
+    for number, query_item in enumerate(query_items, 1):
+        query = query_item["q"]
+        print(f"\n{'=' * 60}")
+        print(f"[{number}/{len(query_items)}] 问题: {query}")
+        print(f"{'=' * 60}")
 
-        # ── 2. 检索质量评估（合并为 1 次调用） ──
-        time.sleep(CALL_DELAY)
-        print("  → 评估检索质量（批量 8 个 chunk，1 次调用）...")
-        retrieval_precision = eval_contextual_precision(q, raw_results)
-        time.sleep(CALL_DELAY)
-        retrieval_recall = eval_contextual_recall(q, retrieved_texts)
+        print("  -> 运行 Agentic RAG...")
+        agentic_state = run_agentic_question(agentic_graph, query)
+        retrieved = agentic_state["retrieved_results"]
+        retrieved_texts = [item["text"] for item in retrieved]
+        answer_rag = agentic_state["answer"]
+        generated = {"text": answer_rag, "attempts": 1, "status": "ok"}
 
-        # ── 3. 回答 ──
-        time.sleep(CALL_DELAY)
-        print("  → 无 RAG 回答...")
-        answer_norag = answer(q, use_rag=False, llm_config=llm_cfg)
-        time.sleep(CALL_DELAY)
-        print("  → 带 RAG 回答...")
-        answer_rag = answer(
-            q, embedder=embedder, faiss_index=index, llm_config=llm_cfg,
-        )
+        time.sleep(args.call_delay)
+        print("  -> 评估检索精确率...")
+        precision = eval_contextual_precision(query, retrieved, judge_config)
+        time.sleep(args.call_delay)
+        print("  -> 评估检索覆盖度...")
+        recall = eval_contextual_recall(query, retrieved_texts, judge_config)
 
-        # ── 4. 生成质量评估 ──
-        time.sleep(CALL_DELAY)
-        print("  → 评估生成质量...")
-        faithfulness = eval_faithfulness(answer_rag, retrieved_texts)
-        time.sleep(CALL_DELAY)
-        relevancy = eval_answer_relevancy(q, answer_rag)
+        no_rag = None
+        if args.include_no_rag:
+            time.sleep(args.call_delay)
+            print("  -> 生成无 RAG 对照...")
+            no_rag = generate_no_rag_answer(
+                query,
+                generator_config,
+                max_attempts=args.generation_attempts,
+            )
+
+        time.sleep(args.call_delay)
+        print("  -> 评估生成质量...")
+        faithfulness = eval_faithfulness(answer_rag, retrieved_texts, judge_config)
+        time.sleep(args.call_delay)
+        relevancy = eval_answer_relevancy(query, answer_rag, judge_config)
 
         entry = {
-            "query": q,
-            "answer_norag": answer_norag,
+            "query_id": query_item.get("id"),
+            "query": query,
+            "lang": query_item.get("lang"),
+            "category": query_item.get("cat"),
+            "query_type": query_item.get("type"),
+            "retrieved_contexts": retrieved,
+            "answer_norag": None if no_rag is None else no_rag["text"],
+            "no_rag_generation_status": no_rag,
             "answer_rag": answer_rag,
+            "generation_status": generated,
+            "agent_trace": agentic_state["trace"],
             "retrieval_metrics": {
-                "contextual_precision": retrieval_precision,
-                "contextual_recall": retrieval_recall,
+                "contextual_precision": precision,
+                "contextual_recall": recall,
             },
             "generation_metrics": {
                 "faithfulness": faithfulness,
@@ -299,53 +740,34 @@ def run_all():
             },
         }
         results.append(entry)
-        print(f"  ✅ 完成")
+        write_output(args.output, run_config, results, complete=False)
+        print("  完成并保存")
 
-    # ── 汇总 ──
-    def avg_score(items, *keys):
-        vals = []
-        for r in items:
-            d = r
-            for k in keys:
-                d = d.get(k, {})
-            if isinstance(d, (int, float)):
-                vals.append(d)
-        return round(sum(vals) / len(vals), 4) if vals else 0.0
-
-    avg_precision = avg_score(results, "retrieval_metrics", "contextual_precision", "score")
-    avg_recall = avg_score(results, "retrieval_metrics", "contextual_recall", "score")
-    avg_faithfulness = avg_score(results, "generation_metrics", "faithfulness", "score")
-    avg_relevancy = avg_score(results, "generation_metrics", "answer_relevancy", "score")
-
-    summary = {
-        "retrieval": {
-            "contextual_precision": avg_precision,
-            "contextual_recall": avg_recall,
-        },
-        "generation": {
-            "faithfulness": avg_faithfulness,
-            "answer_relevancy": avg_relevancy,
-        },
-    }
-
-    output = {"summary": summary, "results": results}
-
-    answers_path = Path(__file__).parent.parent / "answers.json"
-    answers_path.write_text(
-        json.dumps(output, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    write_output(args.output, run_config, results, complete=True)
+    summary = summarize(results)
+    print(f"\n{'=' * 60}")
+    print("评测汇总")
+    print(f"{'=' * 60}")
+    print("  检索质量:")
+    print(
+        "    Contextual Precision: "
+        f"{_format_score(summary['retrieval']['contextual_precision'])}"
     )
-
-    print(f"\n{'='*60}")
-    print("📊 评测汇总")
-    print(f"{'='*60}")
-    print(f"  检索质量:")
-    print(f"    Contextual Precision: {avg_precision:.3f}")
-    print(f"    Contextual Recall:    {avg_recall:.3f}")
-    print(f"  生成质量:")
-    print(f"    Faithfulness:         {avg_faithfulness:.3f}")
-    print(f"    Answer Relevancy:     {avg_relevancy:.3f}")
-    print(f"\n✅ 全部完成！详情已保存到: {answers_path}")
+    print(
+        "    Contextual Recall:    "
+        f"{_format_score(summary['retrieval']['contextual_recall'])}"
+    )
+    print("  生成质量:")
+    print(
+        "    Faithfulness:         "
+        f"{_format_score(summary['generation']['faithfulness'])}"
+    )
+    print(
+        "    Answer Relevancy:     "
+        f"{_format_score(summary['generation']['answer_relevancy'])}"
+    )
+    print(f"  有效样本数: {json.dumps(summary['valid_counts'], ensure_ascii=False)}")
+    print(f"\n结果已保存到: {args.output}")
 
 
 if __name__ == "__main__":

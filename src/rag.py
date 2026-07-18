@@ -247,14 +247,61 @@ def answer(
     )
 
 
-def compare(query: str, embedder, faiss_index, category: str = "", reranker=None):
-    llm_cfg = LLMConfig()
+def build_agentic_runtime(
+    embedder,
+    faiss_index,
+    reranker=None,
+    category: str = "",
+    top_k: int = 8,
+    llm_config: LLMConfig | None = None,
+):
+    """Build the graph around prepared English retrieval queries."""
+    from agentic_rag import (
+        AgenticRAGServices,
+        build_agentic_graph,
+        make_llm_coverage_checker,
+        make_llm_planner,
+    )
+
+    config = llm_config or LLMConfig(
+        model="deepseek-v4-flash", temperature=0, max_tokens=600
+    )
+
+    def retrieve(planned):
+        return hybrid_search(
+            planned.query_en,
+            embedder,
+            faiss_index,
+            top_k=top_k,
+            category=category,
+            verbose=True,
+            reranker=reranker,
+            keywords=planned.keywords,
+        )
+
+    def generate(query, evidence, missing_aspects):
+        return answer(query, llm_config=config, retrieved_results=evidence)
+
+    services = AgenticRAGServices(
+        planner=make_llm_planner(config),
+        retriever=retrieve,
+        coverage_checker=make_llm_coverage_checker(config),
+        answer_generator=generate,
+    )
+    return build_agentic_graph(services, top_k=top_k)
+
+
+def compare(query: str, agentic_graph, llm_config: LLMConfig):
     print(f"\n{'='*60}\n问题: {query}\n{'='*60}\n")
     print("--- 不带 RAG ---")
-    print(answer(query, use_rag=False))
+    print(answer(query, llm_config=llm_config, use_rag=False))
     print()
     print("--- 带 RAG ---")
-    print(answer(query, embedder=embedder, faiss_index=faiss_index, category=category, reranker=reranker))
+    state = agentic_graph.invoke(
+        {"original_query": query},
+        config={"recursion_limit": 10},
+    )
+    print(state["answer"])
     print()
 
 
@@ -299,15 +346,26 @@ if __name__ == "__main__":
     print(f"  索引: {index_name}")
 
     llm_cfg = LLMConfig(provider=args.provider, model=args.model)
+    agentic_graph = build_agentic_runtime(
+        embedder,
+        faiss_index,
+        reranker=reranker,
+        category=args.category,
+        top_k=args.top_k,
+        llm_config=llm_cfg,
+    )
 
     if args.query:
         if args.compare:
-            compare(args.query, embedder, faiss_index, args.category, reranker=reranker)
+            compare(args.query, agentic_graph, llm_cfg)
+        elif args.no_rag:
+            print(answer(args.query, llm_config=llm_cfg, use_rag=False))
         else:
-            print(answer(args.query, embedder=embedder, faiss_index=faiss_index,
-                         category=args.category, llm_config=llm_cfg,
-                         use_rag=not args.no_rag, top_k=args.top_k,
-                         reranker=reranker))
+            state = agentic_graph.invoke(
+                {"original_query": args.query},
+                config={"recursion_limit": 10},
+            )
+            print(state["answer"])
     else:
         label = f"[{args.category}] " if args.category else ""
         print(f"Eu4RAG {label}(/quit)")
@@ -316,10 +374,12 @@ if __name__ == "__main__":
             if q.lower() in ("/quit", "/exit", "/q"):
                 break
             if args.compare:
-                compare(q, embedder, faiss_index, args.category)
+                compare(q, agentic_graph, llm_cfg)
+            elif args.no_rag:
+                print(f"\n{answer(q, llm_config=llm_cfg, use_rag=False)}")
             else:
-                r = answer(q, embedder=embedder, faiss_index=faiss_index,
-                           category=args.category, llm_config=llm_cfg,
-                           use_rag=not args.no_rag, top_k=args.top_k,
-                           reranker=reranker)
-                print(f"\n{r}")
+                state = agentic_graph.invoke(
+                    {"original_query": q},
+                    config={"recursion_limit": 10},
+                )
+                print(f"\n{state['answer']}")

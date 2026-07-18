@@ -26,6 +26,7 @@ Thumbs.db
 # ── 旧测试文件 / 临时调试脚本 ──
 test/*
 !test/test_agentic_rag.py
+!test/test_evaluator.py
 src/debug_*.py
 src/test_*.py
 src/check_*.py
