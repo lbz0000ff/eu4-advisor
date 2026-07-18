@@ -20,6 +20,7 @@ from agentic_rag import (
     make_llm_planner,
 )
 from llm import LLMConfig
+from openai import OpenAIError
 from pydantic import ValidationError
 
 
@@ -177,6 +178,27 @@ class AgenticRAGGraphTest(unittest.TestCase):
         with self.assertRaises(CoverageCheckError):
             build_agentic_graph(services).invoke({"original_query": "question"})
 
+    def test_empty_first_round_without_supplemental_queries_returns_fixed_answer(self) -> None:
+        retrieval_calls: list[str] = []
+        answer_calls: list[str] = []
+        services = AgenticRAGServices(
+            planner=lambda query: QueryPlan(
+                queries=[SearchQuery(query_en="Oirat", keywords=["Oirat"])]
+            ),
+            retriever=lambda query: retrieval_calls.append(query.query_en) or [],
+            coverage_checker=lambda *args: CoverageDecision(
+                sufficient=False, missing_aspects=["facts"], supplemental_queries=[]
+            ),
+            answer_generator=lambda *args: answer_calls.append("called") or "unexpected",
+        )
+
+        result = build_agentic_graph(services).invoke({"original_query": "question"})
+
+        self.assertEqual(retrieval_calls, ["Oirat"])
+        self.assertEqual(result["retrieval_round"], 1)
+        self.assertEqual(result["answer"], "知识库中未找到相关信息")
+        self.assertEqual(answer_calls, [])
+
 
 class LLMDecisionContractTest(unittest.TestCase):
     def test_query_plan_schema_forbids_extra_properties(self) -> None:
@@ -218,6 +240,32 @@ class LLMDecisionContractTest(unittest.TestCase):
         checker = make_llm_coverage_checker(LLMConfig(model="deepseek-v4-flash"))
 
         with patch.object(agentic_rag, "call_function_tool", return_value={"sufficient": True}) as tool_call:
+            with self.assertRaises(CoverageCheckError):
+                checker("question", [hit(1)], 1)
+
+        self.assertEqual(tool_call.call_count, 2)
+
+    def test_planner_openai_error_is_retried_twice_then_converted(self) -> None:
+        planner = make_llm_planner(LLMConfig(model="deepseek-v4-flash"))
+
+        with patch.object(
+            agentic_rag,
+            "call_function_tool",
+            side_effect=OpenAIError("connection failed"),
+        ) as tool_call:
+            with self.assertRaises(QueryPlanningError):
+                planner("瓦剌任务是什么？")
+
+        self.assertEqual(tool_call.call_count, 2)
+
+    def test_coverage_openai_error_is_retried_twice_then_converted(self) -> None:
+        checker = make_llm_coverage_checker(LLMConfig(model="deepseek-v4-flash"))
+
+        with patch.object(
+            agentic_rag,
+            "call_function_tool",
+            side_effect=OpenAIError("request timed out"),
+        ) as tool_call:
             with self.assertRaises(CoverageCheckError):
                 checker("question", [hit(1)], 1)
 

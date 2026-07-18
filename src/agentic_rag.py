@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
+from openai import OpenAIError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from llm import LLMConfig, ToolCallError, call_function_tool
@@ -135,6 +136,8 @@ def build_agentic_graph(services: AgenticRAGServices, top_k: int = DEFAULT_TOP_K
             state["retrieval_round"],
         )
         if (
+            state["retrieved_results"]
+            and
             not decision.sufficient
             and state["retrieval_round"] < MAX_RETRIEVAL_ROUNDS
             and not decision.supplemental_queries
@@ -158,6 +161,10 @@ def build_agentic_graph(services: AgenticRAGServices, top_k: int = DEFAULT_TOP_K
         if (
             state["coverage_sufficient"]
             or state["retrieval_round"] >= MAX_RETRIEVAL_ROUNDS
+            or (
+                not state["retrieved_results"]
+                and not state["pending_queries"]
+            )
         ):
             return "generate_answer"
         return "retrieve"
@@ -207,7 +214,7 @@ def _call_validated_tool(
                 config=config,
             )
             return model_type.model_validate(arguments)
-        except (ToolCallError, ValidationError) as exc:
+        except (ToolCallError, ValidationError, OpenAIError) as exc:
             failures.append(str(exc))
     raise error_type("; ".join(failures))
 
