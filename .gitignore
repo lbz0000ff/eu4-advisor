@@ -25,6 +25,12 @@ Thumbs.db
 
 # ── 旧测试文件 / 临时调试脚本 ──
 test/*
+!test/test_embed.py
+!test/test_reranker.py
+!test/test_rag_timing.py
+!test/test_evaluator.py
+!test/test_llm.py
+!test/test_agentic_rag.py
 src/debug_*.py
 src/test_*.py
 src/check_*.py
@@ -53,4 +59,5 @@ src/__pycache__/
 
 # ── 不忽略 README ──
 *.md
+run_rocm.bat
 !README.md
