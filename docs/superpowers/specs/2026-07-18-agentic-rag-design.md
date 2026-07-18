@@ -49,18 +49,20 @@ State contains serializable data only. Model clients, embedders, FAISS indexes, 
 
 ## Data Flow
 
-The query planner receives the original question and returns strict JSON. Each planned item contains `query_en` and `keywords`. The output is validated before retrieval; Chinese text is not silently passed into the English index when planning fails.
+The query planner receives the original question and returns a `tool_calls` function invocation. The function parameters are described by JSON Schema, and the received arguments are validated again with Pydantic. Each planned item contains `query_en` and `keywords`. Chinese text is not silently passed into the English index when planning fails.
 
 The retrieval node runs FAISS, BM25, RRF, and optional Cross-Encoder reranking for every pending query. Results are deduplicated by chunk index. Existing scores, source, section, and category remain available in the trace and final context.
 
-The coverage node receives the original question plus compact retrieved evidence. It returns strict JSON containing `sufficient`, `missing_aspects`, and `supplemental_queries`. Supplemental queries are used only when the first round is insufficient. After the second round, the graph always proceeds to answer generation.
+The coverage node receives the original question plus compact retrieved evidence. It returns a schema-defined `tool_calls` invocation containing `sufficient`, `missing_aspects`, and `supplemental_queries`. Supplemental queries are used only when the first round is insufficient. After the second round, the graph always proceeds to answer generation.
 
 The answer node uses the original question and all accumulated evidence. It must not introduce facts absent from the evidence. When evidence remains incomplete, it lists the unsupported aspects instead of guessing.
 
 ## Error Handling
 
-- Planner and coverage JSON are parsed and validated with explicit schemas.
-- Invalid or empty LLM output is retried up to two times.
+- Planner and coverage calls use named function tools with explicit JSON Schema and `additionalProperties: false`.
+- Tool arguments are parsed and validated with Pydantic instead of trusting model output.
+- Missing tool calls, invalid arguments, or empty LLM output are retried up to two times.
+- DeepSeek's beta-only server-side `strict` mode is not required; the production endpoint remains usable.
 - Exhausted planner retries raise `QueryPlanningError`; there is no raw-query fallback.
 - Exhausted coverage retries raise `CoverageCheckError`; there is no assumed-success fallback.
 - Retrieval exceptions retain the node name and query in the raised error.
@@ -95,4 +97,3 @@ The implementation uses only the Graph API required by this workflow:
 - `invoke` for synchronous execution.
 
 Persistence, streaming, `Command`, `Send`, subgraphs, and message-specific state are intentionally excluded from this version.
-
