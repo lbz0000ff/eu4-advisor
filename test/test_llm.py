@@ -71,6 +71,74 @@ class FunctionToolCallTest(unittest.TestCase):
                     config=llm.LLMConfig(model="deepseek-v4-flash"),
                 )
 
+    def test_rejects_response_with_different_tool_name(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = _tool_response(
+            "other_tool", "{}"
+        )
+        with patch.object(llm, "build_client", return_value=client):
+            with self.assertRaises(llm.ToolCallError):
+                llm.call_function_tool(
+                    messages=[],
+                    tool_name="submit_plan",
+                    description="Submit retrieval queries.",
+                    parameters={"type": "object", "properties": {}},
+                    config=llm.LLMConfig(model="deepseek-v4-flash"),
+                )
+
+    def test_rejects_tool_call_without_function(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace()]))]
+        )
+        with patch.object(llm, "build_client", return_value=client):
+            with self.assertRaises(llm.ToolCallError):
+                llm.call_function_tool(
+                    messages=[],
+                    tool_name="submit_plan",
+                    description="Submit retrieval queries.",
+                    parameters={"type": "object", "properties": {}},
+                    config=llm.LLMConfig(model="deepseek-v4-flash"),
+                )
+
+    def test_rejects_tool_call_without_function_name(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    tool_calls=[SimpleNamespace(function=SimpleNamespace(arguments="{}"))]
+                )
+            )]
+        )
+        with patch.object(llm, "build_client", return_value=client):
+            with self.assertRaises(llm.ToolCallError):
+                llm.call_function_tool(
+                    messages=[],
+                    tool_name="submit_plan",
+                    description="Submit retrieval queries.",
+                    parameters={"type": "object", "properties": {}},
+                    config=llm.LLMConfig(model="deepseek-v4-flash"),
+                )
+
+    def test_rejects_tool_call_without_arguments(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    tool_calls=[SimpleNamespace(function=SimpleNamespace(name="submit_plan"))]
+                )
+            )]
+        )
+        with patch.object(llm, "build_client", return_value=client):
+            with self.assertRaises(llm.ToolCallError):
+                llm.call_function_tool(
+                    messages=[],
+                    tool_name="submit_plan",
+                    description="Submit retrieval queries.",
+                    parameters={"type": "object", "properties": {}},
+                    config=llm.LLMConfig(model="deepseek-v4-flash"),
+                )
+
     def test_rejects_malformed_tool_arguments(self) -> None:
         client = MagicMock()
         client.chat.completions.create.return_value = _tool_response("submit_plan", "{bad json")

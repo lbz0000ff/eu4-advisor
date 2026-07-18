@@ -145,12 +145,16 @@ def call_function_tool(
     )
 
     calls = response.choices[0].message.tool_calls or []
-    matching = [call for call in calls if call.function.name == tool_name]
+    matching = [
+        call
+        for call in calls
+        if getattr(getattr(call, "function", None), "name", None) == tool_name
+    ]
     if not matching:
         raise ToolCallError(f"model did not call required tool: {tool_name}")
 
     try:
-        arguments = json.loads(matching[0].function.arguments)
+        arguments = json.loads(getattr(matching[0].function, "arguments", None))
     except (TypeError, json.JSONDecodeError) as exc:
         raise ToolCallError(f"invalid arguments for tool {tool_name}: {exc}") from exc
     if not isinstance(arguments, dict):
