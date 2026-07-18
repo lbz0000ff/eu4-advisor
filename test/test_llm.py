@@ -35,6 +35,28 @@ def _tool_response(name: str, arguments: str):
 
 
 class FunctionToolCallTest(unittest.TestCase):
+    def test_can_disable_thinking_for_forced_tool_call(self) -> None:
+        client = MagicMock()
+        client.chat.completions.create.return_value = _tool_response(
+            "submit_plan", "{}"
+        )
+
+        with patch.object(llm, "build_client", return_value=client):
+            llm.call_function_tool(
+                messages=[{"role": "user", "content": "plan this query"}],
+                tool_name="submit_plan",
+                description="Submit retrieval queries.",
+                parameters={"type": "object", "properties": {}},
+                config=llm.LLMConfig(model="deepseek-v4-flash"),
+                thinking=False,
+            )
+
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+
     def test_returns_decoded_arguments_from_named_tool(self) -> None:
         client = MagicMock()
         client.chat.completions.create.return_value = _tool_response(

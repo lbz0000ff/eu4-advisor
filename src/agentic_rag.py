@@ -212,6 +212,7 @@ def _call_validated_tool(
                 description=description,
                 parameters=schema,
                 config=config,
+                thinking=False,
             )
             return model_type.model_validate(arguments)
         except (ToolCallError, ValidationError, OpenAIError) as exc:

@@ -201,6 +201,21 @@ class AgenticRAGGraphTest(unittest.TestCase):
 
 
 class LLMDecisionContractTest(unittest.TestCase):
+    def test_planner_disables_thinking_for_forced_tool_call(self) -> None:
+        planner = make_llm_planner(LLMConfig(model="deepseek-v4-flash"))
+        valid = {
+            "queries": [
+                {"query_en": "Oirat missions", "keywords": ["Oirat", "missions"]}
+            ]
+        }
+
+        with patch.object(
+            agentic_rag, "call_function_tool", return_value=valid
+        ) as tool_call:
+            planner("瓦剌任务是什么？")
+
+        self.assertFalse(tool_call.call_args.kwargs["thinking"])
+
     def test_query_plan_schema_forbids_extra_properties(self) -> None:
         schema = QueryPlan.model_json_schema()
 

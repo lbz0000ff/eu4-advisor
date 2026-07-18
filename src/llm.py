@@ -118,6 +118,7 @@ def call_function_tool(
     parameters: dict[str, Any],
     config: Optional[LLMConfig] = None,
     system_prompt: Optional[str] = None,
+    thinking: Optional[bool] = None,
 ) -> dict[str, Any]:
     _ensure_env()
     if config is None:
@@ -127,6 +128,12 @@ def call_function_tool(
     if system_prompt:
         full_messages.append({"role": "system", "content": system_prompt})
     full_messages.extend(messages)
+
+    request_kwargs: dict[str, Any] = {}
+    if thinking is not None:
+        request_kwargs["extra_body"] = {
+            "thinking": {"type": "enabled" if thinking else "disabled"}
+        }
 
     response = build_client(config).chat.completions.create(
         model=config.model or _from_env("LLM_MODEL", "deepseek-v4-flash"),
@@ -142,6 +149,7 @@ def call_function_tool(
             },
         }],
         tool_choice={"type": "function", "function": {"name": tool_name}},
+        **request_kwargs,
     )
 
     calls = response.choices[0].message.tool_calls or []
