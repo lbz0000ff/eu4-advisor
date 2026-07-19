@@ -145,6 +145,60 @@ class AgenticEvaluationTest(unittest.TestCase):
         )
 
 
+class EvaluationModeTest(unittest.TestCase):
+    def test_parse_args_requires_explicit_mode(self) -> None:
+        args = evaluator.parse_args(["--mode", "baseline"])
+
+        self.assertEqual(args.mode, "baseline")
+
+    def test_baseline_retrieves_once_and_generates_from_same_results(self) -> None:
+        retrieved = [{"chunk_index": 1, "text": "context", "source": "wiki.md"}]
+        with (
+            patch.object(evaluator, "hybrid_search", return_value=retrieved) as search,
+            patch.object(evaluator, "answer", return_value="grounded answer") as generate,
+        ):
+            state = evaluator.run_baseline_question(
+                "original query",
+                embedder="embedder",
+                index="index",
+                reranker="reranker",
+                generator_config=evaluator.LLMConfig(model="model"),
+            )
+
+        search.assert_called_once()
+        self.assertEqual(search.call_args.args[0], "original query")
+        self.assertIs(generate.call_args.kwargs["retrieved_results"], retrieved)
+        self.assertEqual(state["answer"], "grounded answer")
+        self.assertIs(state["retrieved_results"], retrieved)
+        self.assertEqual(len(state["trace"]["retrievals"]), 1)
+
+    def test_baseline_retries_generation_without_repeating_retrieval(self) -> None:
+        retrieved = [{"chunk_index": 1, "text": "context", "source": "wiki.md"}]
+        sleep = unittest.mock.MagicMock()
+        with (
+            patch.object(evaluator, "hybrid_search", return_value=retrieved) as search,
+            patch.object(
+                evaluator,
+                "answer",
+                side_effect=[ConnectionError("network down"), "recovered"],
+            ) as generate,
+        ):
+            state = evaluator.run_baseline_question(
+                "original query",
+                embedder="embedder",
+                index="index",
+                reranker="reranker",
+                generator_config=evaluator.LLMConfig(model="model"),
+                base_delay=2.0,
+                sleep_fn=sleep,
+            )
+
+        search.assert_called_once()
+        self.assertEqual(generate.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(state["answer"], "recovered")
+
+
 class EvaluationResumeTest(unittest.TestCase):
     def test_resume_keeps_only_successful_matching_queries(self) -> None:
         payload = {
@@ -182,6 +236,22 @@ class EvaluationResumeTest(unittest.TestCase):
             )
 
         self.assertEqual(resumed, {})
+
+    def test_resume_rejects_results_from_other_mode(self) -> None:
+        payload = {
+            "run_config": {"query_count": 1, "evaluation_mode": "baseline"},
+            "results": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "模式"):
+                evaluator.load_successful_resume_results(
+                    path,
+                    [{"id": 101, "q": "question"}],
+                    expected_mode="agentic",
+                )
 
     def test_results_are_written_in_query_order(self) -> None:
         ordered = evaluator.order_results(

@@ -21,7 +21,7 @@ load_dotenv(ROOT / ".env")
 
 from embed import Embedder
 from llm import LLMConfig, chat
-from rag import answer, build_agentic_runtime, chunks
+from rag import answer, build_agentic_runtime, chunks, hybrid_search
 from reranker import get_reranker
 
 
@@ -45,8 +45,14 @@ ABSTENTION_ANSWERS = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["baseline", "agentic"],
+        help="评测单轮混合检索或 LangGraph Agentic RAG",
+    )
     parser.add_argument("--sample", type=int, default=0, help="只跑前 N 条")
     parser.add_argument("--lang", default="", choices=["en", "zh", ""], help="按语言过滤")
     parser.add_argument("--include-no-rag", action="store_true", help="额外生成无 RAG 对照回答")
@@ -54,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--call-delay", type=float, default=CALL_DELAY, help="模型调用间隔秒数")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="结果 JSON 路径")
     parser.add_argument("--resume", action="store_true", help="复用输出文件中的成功题目并续跑")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_queries(args: argparse.Namespace | None = None) -> list[dict[str, Any]]:
@@ -613,6 +619,7 @@ def write_output(
 def load_successful_resume_results(
     output_path: Path,
     query_items: list[dict[str, Any]],
+    expected_mode: str | None = None,
 ) -> dict[Any, dict[str, Any]]:
     if not output_path.exists():
         return {}
@@ -622,6 +629,11 @@ def load_successful_resume_results(
     if previous_count != expected_count:
         raise ValueError(
             f"无法续跑: 结果文件配置为 {previous_count} 题，当前为 {expected_count} 题"
+        )
+    previous_mode = payload.get("run_config", {}).get("evaluation_mode")
+    if expected_mode is not None and previous_mode != expected_mode:
+        raise ValueError(
+            f"无法续跑: 结果文件模式为 {previous_mode!r}，当前模式为 {expected_mode!r}"
         )
 
     allowed_queries = {item.get("id"): item.get("q") for item in query_items}
@@ -688,9 +700,26 @@ def is_transient_connection_error(error: BaseException) -> bool:
     return False
 
 
-def run_agentic_question(
-    graph,
-    query: str,
+def _failure_state(error: Exception, transient: bool, attempts: int) -> dict[str, Any]:
+    error_type = type(error).__name__
+    error_message = str(error)
+    return {
+        "answer": "",
+        "retrieved_results": [],
+        "trace": {
+            "plans": [],
+            "retrievals": [],
+            "coverage": [],
+            "failure": {"type": error_type, "message": error_message},
+        },
+        "failure_reason": f"{error_type}: {error_message}",
+        "transient_failure": transient,
+        "attempts": attempts,
+    }
+
+
+def _run_with_connection_retries(
+    operation,
     max_attempts: int = 4,
     base_delay: float = 2.0,
     sleep_fn=time.sleep,
@@ -698,9 +727,7 @@ def run_agentic_question(
     attempts = max(1, max_attempts)
     for attempt in range(1, attempts + 1):
         try:
-            state = graph.invoke(
-                {"original_query": query}, config={"recursion_limit": 10}
-            )
+            state = operation()
             state["attempts"] = attempt
             return state
         except Exception as error:
@@ -714,23 +741,80 @@ def run_agentic_question(
                 sleep_fn(delay)
                 continue
 
-            error_type = type(error).__name__
-            error_message = str(error)
-            return {
-                "answer": "",
-                "retrieved_results": [],
-                "trace": {
-                    "plans": [],
-                    "retrievals": [],
-                    "coverage": [],
-                    "failure": {"type": error_type, "message": error_message},
-                },
-                "failure_reason": f"{error_type}: {error_message}",
-                "transient_failure": transient,
-                "attempts": attempt,
-            }
+            return _failure_state(error, transient, attempt)
 
     raise AssertionError("unreachable")
+
+
+def run_agentic_question(
+    graph,
+    query: str,
+    max_attempts: int = 4,
+    base_delay: float = 2.0,
+    sleep_fn=time.sleep,
+) -> dict[str, Any]:
+    return _run_with_connection_retries(
+        lambda: graph.invoke(
+            {"original_query": query}, config={"recursion_limit": 10}
+        ),
+        max_attempts=max_attempts,
+        base_delay=base_delay,
+        sleep_fn=sleep_fn,
+    )
+
+
+def run_baseline_question(
+    query: str,
+    *,
+    embedder,
+    index,
+    reranker,
+    generator_config: LLMConfig,
+    max_attempts: int = 4,
+    base_delay: float = 2.0,
+    sleep_fn=time.sleep,
+) -> dict[str, Any]:
+    try:
+        retrieved = hybrid_search(
+            query,
+            embedder,
+            index,
+            top_k=TOP_K,
+            verbose=True,
+            reranker=reranker,
+        )
+    except Exception as error:
+        return _failure_state(error, is_transient_connection_error(error), 1)
+
+    trace = {
+        "plans": [],
+        "retrievals": [
+            {
+                "round": 1,
+                "mode": "baseline",
+                "queries": [{"query": query, "count": len(retrieved)}],
+            }
+        ],
+        "coverage": [],
+    }
+
+    def generate() -> dict[str, Any]:
+        return {
+            "answer": answer(
+                query,
+                llm_config=generator_config,
+                retrieved_results=retrieved,
+            ),
+            "retrieved_results": retrieved,
+            "trace": trace,
+        }
+
+    return _run_with_connection_retries(
+        generate,
+        max_attempts=max_attempts,
+        base_delay=base_delay,
+        sleep_fn=sleep_fn,
+    )
 
 
 def generation_status_from_agentic_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -768,13 +852,15 @@ def run_all() -> None:
     generator_config = build_generator_config()
     judge_config = build_judge_config()
     embedder, index, reranker = load_components()
-    agentic_graph = build_agentic_runtime(
-        embedder,
-        index,
-        reranker=reranker,
-        top_k=TOP_K,
-        llm_config=generator_config,
-    )
+    agentic_graph = None
+    if args.mode == "agentic":
+        agentic_graph = build_agentic_runtime(
+            embedder,
+            index,
+            reranker=reranker,
+            top_k=TOP_K,
+            llm_config=generator_config,
+        )
     judge_independent = (
         generator_config.model != judge_config.model
         or generator_config.base_url != judge_config.base_url
@@ -784,6 +870,7 @@ def run_all() -> None:
 
     run_config = {
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "evaluation_mode": args.mode,
         "query_count": len(query_items),
         "question_set": {
             "path": str(EVAL_FILE),
@@ -806,20 +893,24 @@ def run_all() -> None:
             "fusion": "RRF",
             "rerank_top_k": TOP_K,
         },
-        "agentic_rag": {
-            "framework": "LangGraph",
-            "max_retrieval_rounds": 2,
-            "max_queries_per_round": 3,
-            "decision_format": "tool_calls + Pydantic",
-            "connection_retry": {
-                "max_attempts": AGENTIC_MAX_ATTEMPTS,
-                "base_delay_seconds": AGENTIC_RETRY_BASE_DELAY,
-                "consecutive_failure_limit": TRANSIENT_FAILURE_LIMIT,
-            },
+        "pipeline": {
+            "mode": args.mode,
+            "framework": "LangGraph" if args.mode == "agentic" else None,
+            "max_retrieval_rounds": 2 if args.mode == "agentic" else 1,
+            "max_queries_per_round": 3 if args.mode == "agentic" else 1,
+            "query_planning": args.mode == "agentic",
+            "coverage_check": args.mode == "agentic",
+        },
+        "connection_retry": {
+            "max_attempts": AGENTIC_MAX_ATTEMPTS,
+            "base_delay_seconds": AGENTIC_RETRY_BASE_DELAY,
+            "consecutive_failure_limit": TRANSIENT_FAILURE_LIMIT,
         },
     }
     results_by_id = (
-        load_successful_resume_results(args.output, query_items)
+        load_successful_resume_results(
+            args.output, query_items, expected_mode=args.mode
+        )
         if args.resume
         else {}
     )
@@ -837,22 +928,33 @@ def run_all() -> None:
         print(f"[{number}/{len(query_items)}] 问题: {query}")
         print(f"{'=' * 60}")
 
-        print("  -> 运行 Agentic RAG...")
-        agentic_state = run_agentic_question(
-            agentic_graph,
-            query,
-            max_attempts=AGENTIC_MAX_ATTEMPTS,
-            base_delay=AGENTIC_RETRY_BASE_DELAY,
-        )
-        retrieved = agentic_state["retrieved_results"]
+        print(f"  -> 运行 {args.mode} RAG...")
+        if args.mode == "agentic":
+            state = run_agentic_question(
+                agentic_graph,
+                query,
+                max_attempts=AGENTIC_MAX_ATTEMPTS,
+                base_delay=AGENTIC_RETRY_BASE_DELAY,
+            )
+        else:
+            state = run_baseline_question(
+                query,
+                embedder=embedder,
+                index=index,
+                reranker=reranker,
+                generator_config=generator_config,
+                max_attempts=AGENTIC_MAX_ATTEMPTS,
+                base_delay=AGENTIC_RETRY_BASE_DELAY,
+            )
+        retrieved = state["retrieved_results"]
         retrieved_texts = [item["text"] for item in retrieved]
-        generated = generation_status_from_agentic_state(agentic_state)
+        generated = generation_status_from_agentic_state(state)
         answer_rag = generated["text"]
 
         if generated["status"] == "failed":
             failure_reason = (
-                "agentic_rag_failed"
-                if agentic_state.get("failure_reason")
+                f"{args.mode}_rag_failed"
+                if state.get("failure_reason")
                 else generated["failure_reason"]
             )
             metrics = _failed_metrics(failure_reason)
@@ -902,6 +1004,7 @@ def run_all() -> None:
 
         entry = {
             "query_id": query_item.get("id"),
+            "evaluation_mode": args.mode,
             "pair_id": query_item.get("pair_id"),
             "query": query,
             "lang": query_item.get("lang"),
@@ -915,7 +1018,7 @@ def run_all() -> None:
             "no_rag_generation_status": no_rag,
             "answer_rag": answer_rag,
             "generation_status": generated,
-            "agent_trace": agentic_state["trace"],
+            "agent_trace": state["trace"],
             "retrieval_metrics": {
                 "contextual_precision": precision,
                 "contextual_recall": recall,
@@ -933,7 +1036,7 @@ def run_all() -> None:
         consecutive_transient_failures, should_abort = (
             update_transient_failure_streak(
                 consecutive_transient_failures,
-                agentic_state,
+                state,
             )
         )
         if should_abort:
