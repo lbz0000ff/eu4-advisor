@@ -29,6 +29,9 @@ EVAL_FILE = ROOT / "eval" / "queries.json"
 DEFAULT_OUTPUT = ROOT / "answers.json"
 TOP_K = 8
 CALL_DELAY = 0.5
+AGENTIC_MAX_ATTEMPTS = 4
+AGENTIC_RETRY_BASE_DELAY = 2.0
+TRANSIENT_FAILURE_LIMIT = 3
 
 EU4_CONTEXT = """注意：所有用户问题都是关于《欧陆风云4》（Europa Universalis IV）这款游戏的，不是现实历史。
 例如 "What is Prussia?" 问的是游戏中的普鲁士（可玩国家/可成立国家），不是现实中的普鲁士王国。
@@ -50,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generation-attempts", type=int, default=2, help="空回答或异常时的生成尝试次数")
     parser.add_argument("--call-delay", type=float, default=CALL_DELAY, help="模型调用间隔秒数")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="结果 JSON 路径")
+    parser.add_argument("--resume", action="store_true", help="复用输出文件中的成功题目并续跑")
     return parser.parse_args()
 
 
@@ -584,6 +588,50 @@ def write_output(
     )
 
 
+def load_successful_resume_results(
+    output_path: Path,
+    query_items: list[dict[str, Any]],
+) -> dict[Any, dict[str, Any]]:
+    if not output_path.exists():
+        return {}
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    expected_count = len(query_items)
+    previous_count = payload.get("run_config", {}).get("query_count")
+    if previous_count != expected_count:
+        raise ValueError(
+            f"无法续跑: 结果文件配置为 {previous_count} 题，当前为 {expected_count} 题"
+        )
+
+    allowed_ids = {item.get("id") for item in query_items}
+    successful: dict[Any, dict[str, Any]] = {}
+    for result in payload.get("results", []):
+        query_id = result.get("query_id")
+        status = result.get("generation_status", {}).get("status")
+        if query_id in allowed_ids and status == "ok":
+            successful[query_id] = result
+    return successful
+
+
+def order_results(
+    query_items: list[dict[str, Any]],
+    results_by_id: dict[Any, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        results_by_id[item.get("id")]
+        for item in query_items
+        if item.get("id") in results_by_id
+    ]
+
+
+def update_transient_failure_streak(
+    current: int,
+    state: dict[str, Any],
+    limit: int = TRANSIENT_FAILURE_LIMIT,
+) -> tuple[int, bool]:
+    streak = current + 1 if state.get("transient_failure") else 0
+    return streak, streak >= limit
+
+
 def _format_score(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.3f}"
 
@@ -601,23 +649,62 @@ def agentic_failure_metrics() -> dict[str, dict[str, Any]]:
     return _failed_metrics("agentic_rag_failed")
 
 
-def run_agentic_question(graph, query: str) -> dict[str, Any]:
-    try:
-        return graph.invoke({"original_query": query}, config={"recursion_limit": 10})
-    except Exception as error:
-        error_type = type(error).__name__
-        error_message = str(error)
-        return {
-            "answer": "",
-            "retrieved_results": [],
-            "trace": {
-                "plans": [],
-                "retrievals": [],
-                "coverage": [],
-                "failure": {"type": error_type, "message": error_message},
-            },
-            "failure_reason": f"{error_type}: {error_message}",
-        }
+def is_transient_connection_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        if type(current).__name__ in {"APIConnectionError", "APITimeoutError"}:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def run_agentic_question(
+    graph,
+    query: str,
+    max_attempts: int = 4,
+    base_delay: float = 2.0,
+    sleep_fn=time.sleep,
+) -> dict[str, Any]:
+    attempts = max(1, max_attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            state = graph.invoke(
+                {"original_query": query}, config={"recursion_limit": 10}
+            )
+            state["attempts"] = attempt
+            return state
+        except Exception as error:
+            transient = is_transient_connection_error(error)
+            if transient and attempt < attempts:
+                delay = base_delay * (2 ** (attempt - 1))
+                print(
+                    f"  DeepSeek 连接失败，第 {attempt}/{attempts} 次，"
+                    f"{delay:g} 秒后重试..."
+                )
+                sleep_fn(delay)
+                continue
+
+            error_type = type(error).__name__
+            error_message = str(error)
+            return {
+                "answer": "",
+                "retrieved_results": [],
+                "trace": {
+                    "plans": [],
+                    "retrievals": [],
+                    "coverage": [],
+                    "failure": {"type": error_type, "message": error_message},
+                },
+                "failure_reason": f"{error_type}: {error_message}",
+                "transient_failure": transient,
+                "attempts": attempt,
+            }
+
+    raise AssertionError("unreachable")
 
 
 def generation_status_from_agentic_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -626,7 +713,7 @@ def generation_status_from_agentic_state(state: dict[str, Any]) -> dict[str, Any
     if failure_reason:
         return {
             "text": answer_text if isinstance(answer_text, str) else "",
-            "attempts": 1,
+            "attempts": int(state.get("attempts", 1)),
             "status": "failed",
             "failure_reason": failure_reason,
         }
@@ -639,7 +726,7 @@ def generation_status_from_agentic_state(state: dict[str, Any]) -> dict[str, Any
         }
     return {
         "text": answer_text,
-        "attempts": 1,
+        "attempts": int(state.get("attempts", 1)),
         "status": "ok",
         "failure_reason": "",
     }
@@ -697,18 +784,39 @@ def run_all() -> None:
             "max_retrieval_rounds": 2,
             "max_queries_per_round": 3,
             "decision_format": "tool_calls + Pydantic",
+            "connection_retry": {
+                "max_attempts": AGENTIC_MAX_ATTEMPTS,
+                "base_delay_seconds": AGENTIC_RETRY_BASE_DELAY,
+                "consecutive_failure_limit": TRANSIENT_FAILURE_LIMIT,
+            },
         },
     }
-    results: list[dict[str, Any]] = []
+    results_by_id = (
+        load_successful_resume_results(args.output, query_items)
+        if args.resume
+        else {}
+    )
+    if results_by_id:
+        print(f"断点续跑: 复用 {len(results_by_id)} 条成功结果")
+    consecutive_transient_failures = 0
 
     for number, query_item in enumerate(query_items, 1):
         query = query_item["q"]
+        query_id = query_item.get("id")
+        if query_id in results_by_id:
+            print(f"[{number}/{len(query_items)}] 已完成，跳过: {query}")
+            continue
         print(f"\n{'=' * 60}")
         print(f"[{number}/{len(query_items)}] 问题: {query}")
         print(f"{'=' * 60}")
 
         print("  -> 运行 Agentic RAG...")
-        agentic_state = run_agentic_question(agentic_graph, query)
+        agentic_state = run_agentic_question(
+            agentic_graph,
+            query,
+            max_attempts=AGENTIC_MAX_ATTEMPTS,
+            base_delay=AGENTIC_RETRY_BASE_DELAY,
+        )
         retrieved = agentic_state["retrieved_results"]
         retrieved_texts = [item["text"] for item in retrieved]
         generated = generation_status_from_agentic_state(agentic_state)
@@ -771,10 +879,25 @@ def run_all() -> None:
                 "answer_relevancy": relevancy,
             },
         }
-        results.append(entry)
+        results_by_id[query_id] = entry
+        results = order_results(query_items, results_by_id)
         write_output(args.output, run_config, results, complete=False)
         print("  完成并保存")
 
+        consecutive_transient_failures, should_abort = (
+            update_transient_failure_streak(
+                consecutive_transient_failures,
+                agentic_state,
+            )
+        )
+        if should_abort:
+            print(
+                f"连续 {TRANSIENT_FAILURE_LIMIT} 题连接失败，评测已中止。"
+                "网络恢复后使用 --resume 继续。"
+            )
+            return
+
+    results = order_results(query_items, results_by_id)
     write_output(args.output, run_config, results, complete=True)
     summary = summarize(results)
     print(f"\n{'=' * 60}")

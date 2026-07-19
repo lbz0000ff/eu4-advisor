@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -42,6 +44,54 @@ class RagAnswerTest(unittest.TestCase):
 
 
 class AgenticEvaluationTest(unittest.TestCase):
+    def test_transient_connection_failure_retries_with_exponential_backoff(self) -> None:
+        graph = unittest.mock.MagicMock()
+        graph.invoke.side_effect = [
+            ConnectionError("network down"),
+            TimeoutError("request timed out"),
+            {
+                "answer": "answer",
+                "retrieved_results": [{"text": "context"}],
+                "trace": {"plans": [], "retrievals": [], "coverage": []},
+            },
+        ]
+        sleep = unittest.mock.MagicMock()
+
+        result = evaluator.run_agentic_question(
+            graph,
+            "query",
+            max_attempts=4,
+            base_delay=2.0,
+            sleep_fn=sleep,
+        )
+
+        self.assertEqual(result["answer"], "answer")
+        self.assertEqual(graph.invoke.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 4.0])
+
+    def test_non_transient_graph_failure_is_not_retried(self) -> None:
+        graph = unittest.mock.MagicMock()
+        graph.invoke.side_effect = RuntimeError("invalid graph state")
+
+        result = evaluator.run_agentic_question(graph, "query", max_attempts=4)
+
+        self.assertEqual(graph.invoke.call_count, 1)
+        self.assertFalse(result["transient_failure"])
+
+    def test_exhausted_connection_retries_are_marked_transient(self) -> None:
+        graph = unittest.mock.MagicMock()
+        graph.invoke.side_effect = ConnectionError("network down")
+
+        result = evaluator.run_agentic_question(
+            graph,
+            "query",
+            max_attempts=3,
+            base_delay=0,
+        )
+
+        self.assertEqual(graph.invoke.call_count, 3)
+        self.assertTrue(result["transient_failure"])
+
     def test_one_graph_invocation_returns_answer_contexts_and_trace(self) -> None:
         graph = unittest.mock.MagicMock()
         graph.invoke.return_value = {
@@ -92,6 +142,50 @@ class AgenticEvaluationTest(unittest.TestCase):
         self.assertEqual(
             metrics["answer_relevancy"]["failure_reason"],
             "agentic_rag_failed",
+        )
+
+
+class EvaluationResumeTest(unittest.TestCase):
+    def test_resume_keeps_only_successful_matching_queries(self) -> None:
+        payload = {
+            "run_config": {"query_count": 3},
+            "results": [
+                {"query_id": 101, "generation_status": {"status": "ok"}},
+                {"query_id": 102, "generation_status": {"status": "failed"}},
+                {"query_id": 999, "generation_status": {"status": "ok"}},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            resumed = evaluator.load_successful_resume_results(
+                path,
+                [{"id": 101}, {"id": 102}, {"id": 103}],
+            )
+
+        self.assertEqual(set(resumed), {101})
+
+    def test_results_are_written_in_query_order(self) -> None:
+        ordered = evaluator.order_results(
+            [{"id": 101}, {"id": 102}, {"id": 103}],
+            {103: {"query_id": 103}, 101: {"query_id": 101}},
+        )
+
+        self.assertEqual([item["query_id"] for item in ordered], [101, 103])
+
+    def test_transient_failure_streak_resets_and_trips_at_limit(self) -> None:
+        self.assertEqual(
+            evaluator.update_transient_failure_streak(
+                2, {"transient_failure": False}, limit=3
+            ),
+            (0, False),
+        )
+        self.assertEqual(
+            evaluator.update_transient_failure_streak(
+                2, {"transient_failure": True}, limit=3
+            ),
+            (3, True),
         )
 
 

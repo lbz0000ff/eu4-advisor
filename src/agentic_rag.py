@@ -203,6 +203,7 @@ def _call_validated_tool(
     error_type: type[RuntimeError],
 ) -> BaseModel:
     failures: list[str] = []
+    last_error: Exception | None = None
     schema = model_type.model_json_schema()
     for _ in range(2):
         try:
@@ -217,7 +218,8 @@ def _call_validated_tool(
             return model_type.model_validate(arguments)
         except (ToolCallError, ValidationError, OpenAIError) as exc:
             failures.append(str(exc))
-    raise error_type("; ".join(failures))
+            last_error = exc
+    raise error_type("; ".join(failures)) from last_error
 
 
 def make_llm_planner(config: LLMConfig) -> Callable[[str], QueryPlan]:
