@@ -150,9 +150,9 @@ class EvaluationResumeTest(unittest.TestCase):
         payload = {
             "run_config": {"query_count": 3},
             "results": [
-                {"query_id": 101, "generation_status": {"status": "ok"}},
-                {"query_id": 102, "generation_status": {"status": "failed"}},
-                {"query_id": 999, "generation_status": {"status": "ok"}},
+                {"query_id": 101, "query": "same", "generation_status": {"status": "ok"}},
+                {"query_id": 102, "query": "failed", "generation_status": {"status": "failed"}},
+                {"query_id": 999, "query": "unknown", "generation_status": {"status": "ok"}},
             ]
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -161,10 +161,27 @@ class EvaluationResumeTest(unittest.TestCase):
 
             resumed = evaluator.load_successful_resume_results(
                 path,
-                [{"id": 101}, {"id": 102}, {"id": 103}],
+                [{"id": 101, "q": "same"}, {"id": 102, "q": "failed"}, {"id": 103, "q": "missing"}],
             )
 
         self.assertEqual(set(resumed), {101})
+
+    def test_resume_does_not_reuse_changed_question_text(self) -> None:
+        payload = {
+            "run_config": {"query_count": 1},
+            "results": [
+                {"query_id": 101, "query": "old wording", "generation_status": {"status": "ok"}}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            resumed = evaluator.load_successful_resume_results(
+                path, [{"id": 101, "q": "new wording"}]
+            )
+
+        self.assertEqual(resumed, {})
 
     def test_results_are_written_in_query_order(self) -> None:
         ordered = evaluator.order_results(
@@ -187,6 +204,27 @@ class EvaluationResumeTest(unittest.TestCase):
             ),
             (3, True),
         )
+
+
+class EvaluationDatasetTest(unittest.TestCase):
+    def test_v2_questions_form_thirty_symmetric_bilingual_pairs(self) -> None:
+        questions = json.loads((ROOT / "eval" / "queries.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(questions), 60)
+        pairs: dict[str, list[dict]] = {}
+        for item in questions:
+            pairs.setdefault(item["pair_id"], []).append(item)
+            self.assertIn(item["difficulty"], {"easy", "medium", "hard"})
+            self.assertIsInstance(item["answerable"], bool)
+            if item["answerable"]:
+                self.assertGreaterEqual(len(item["reference_points"]), 2)
+
+        self.assertEqual(len(pairs), 30)
+        for members in pairs.values():
+            self.assertEqual({item["lang"] for item in members}, {"en", "zh"})
+            self.assertEqual(len(members), 2)
+            for field in ("cat", "type", "answerable", "reference_points"):
+                self.assertEqual(members[0][field], members[1][field])
 
 
 class JudgeParsingTest(unittest.TestCase):
@@ -253,6 +291,38 @@ class MetricEvaluationTest(unittest.TestCase):
         self.assertIsNone(result["score"])
         self.assertFalse(result["valid"])
         self.assertEqual(result["failure_reason"], "empty_answer")
+
+    def test_contextual_recall_uses_reference_points(self) -> None:
+        judged = {"score": 0.8, "reason": "covered", "_judge_raw": "raw", "_judge_attempts": 1}
+        with patch.object(evaluator, "judge_json", return_value=judged) as judge:
+            result = evaluator.eval_contextual_recall(
+                "question",
+                ["context"],
+                reference_points=["point one", "point two"],
+            )
+
+        self.assertEqual(result["score"], 0.8)
+        prompt = judge.call_args.args[0]
+        self.assertIn("point one", prompt)
+        self.assertIn("point two", prompt)
+
+    def test_contextual_recall_is_not_applicable_to_unanswerable_question(self) -> None:
+        result = evaluator.eval_contextual_recall(
+            "future prediction", ["context"], answerable=False
+        )
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["failure_reason"], "not_applicable_unanswerable")
+
+    def test_abstention_is_relevant_for_unanswerable_question(self) -> None:
+        result = evaluator.eval_answer_relevancy(
+            "future prediction",
+            "知识库中未找到相关信息",
+            answerable=False,
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["score"], 1.0)
 
 
 class SummaryTest(unittest.TestCase):

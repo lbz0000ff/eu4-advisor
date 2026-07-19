@@ -340,7 +340,11 @@ def eval_contextual_recall(
     query: str,
     all_chunk_texts: list[str],
     judge_config: LLMConfig | None = None,
+    reference_points: list[str] | None = None,
+    answerable: bool = True,
 ) -> dict[str, Any]:
+    if not answerable:
+        return _invalid_metric("not_applicable_unanswerable")
     if not all_chunk_texts:
         return {
             "score": 0.0,
@@ -349,12 +353,16 @@ def eval_contextual_recall(
             "evaluation_mode": "deterministic_empty_retrieval",
         }
     combined = "\n\n---\n\n".join(all_chunk_texts[:TOP_K])
+    expected = "\n".join(f"- {point}" for point in (reference_points or []))
     prompt = f"""{EU4_CONTEXT}
 
-判断检索内容是否包含足够信息回答用户问题。只输出 JSON。
+判断检索内容是否覆盖参考答案要点并足以回答用户问题。只输出 JSON。
 
 用户问题:
 {query}
+
+参考答案要点:
+{expected or "未提供额外要点，请根据问题判断"}
 
 检索内容:
 {combined}
@@ -440,6 +448,7 @@ def eval_answer_relevancy(
     query: str,
     answer_text: str,
     judge_config: LLMConfig | None = None,
+    answerable: bool = True,
 ) -> dict[str, Any]:
     if not answer_text or not answer_text.strip():
         return {
@@ -450,15 +459,28 @@ def eval_answer_relevancy(
         }
     if is_abstention(answer_text):
         return {
-            "score": 0.0,
+            "score": 0.0 if answerable else 1.0,
             "valid": True,
-            "reason": "模型拒答或未检索到信息",
+            "reason": (
+                "可回答问题发生拒答"
+                if answerable
+                else "不可回答问题被正确拒答"
+            ),
             "evaluation_mode": "deterministic_abstention",
         }
 
+    answerability_instruction = (
+        "该问题被标记为不可由当前知识库确定回答。回答应明确说明无法确定、"
+        "不存在普遍答案或需要额外条件，而不是编造确定结论。"
+        if not answerable
+        else "该问题可由知识库回答。"
+    )
     prompt = f"""{EU4_CONTEXT}
 
 判断 AI 回答是否直接针对用户问题。只输出 JSON。
+
+答案条件:
+{answerability_instruction}
 
 用户问题:
 {query}
@@ -602,12 +624,16 @@ def load_successful_resume_results(
             f"无法续跑: 结果文件配置为 {previous_count} 题，当前为 {expected_count} 题"
         )
 
-    allowed_ids = {item.get("id") for item in query_items}
+    allowed_queries = {item.get("id"): item.get("q") for item in query_items}
     successful: dict[Any, dict[str, Any]] = {}
     for result in payload.get("results", []):
         query_id = result.get("query_id")
         status = result.get("generation_status", {}).get("status")
-        if query_id in allowed_ids and status == "ok":
+        if (
+            query_id in allowed_queries
+            and result.get("query") == allowed_queries[query_id]
+            and status == "ok"
+        ):
             successful[query_id] = result
     return successful
 
@@ -761,6 +787,7 @@ def run_all() -> None:
         "query_count": len(query_items),
         "question_set": {
             "path": str(EVAL_FILE),
+            "version": "v2",
             "origin": "project-specific, AI-assisted generation",
             "standard_benchmark": False,
             "total_questions": 60,
@@ -839,7 +866,13 @@ def run_all() -> None:
             precision = eval_contextual_precision(query, retrieved, judge_config)
             time.sleep(args.call_delay)
             print("  -> 评估检索覆盖度...")
-            recall = eval_contextual_recall(query, retrieved_texts, judge_config)
+            recall = eval_contextual_recall(
+                query,
+                retrieved_texts,
+                judge_config,
+                reference_points=query_item.get("reference_points", []),
+                answerable=query_item.get("answerable", True),
+            )
 
         no_rag = None
         if args.include_no_rag:
@@ -854,16 +887,29 @@ def run_all() -> None:
         if generated["status"] == "ok":
             time.sleep(args.call_delay)
             print("  -> 评估生成质量...")
-            faithfulness = eval_faithfulness(answer_rag, retrieved_texts, judge_config)
+            faithfulness = (
+                eval_faithfulness(answer_rag, retrieved_texts, judge_config)
+                if query_item.get("answerable", True)
+                else _invalid_metric("not_applicable_unanswerable")
+            )
             time.sleep(args.call_delay)
-            relevancy = eval_answer_relevancy(query, answer_rag, judge_config)
+            relevancy = eval_answer_relevancy(
+                query,
+                answer_rag,
+                judge_config,
+                answerable=query_item.get("answerable", True),
+            )
 
         entry = {
             "query_id": query_item.get("id"),
+            "pair_id": query_item.get("pair_id"),
             "query": query,
             "lang": query_item.get("lang"),
             "category": query_item.get("cat"),
             "query_type": query_item.get("type"),
+            "difficulty": query_item.get("difficulty"),
+            "answerable": query_item.get("answerable", True),
+            "reference_points": query_item.get("reference_points", []),
             "retrieved_contexts": retrieved,
             "answer_norag": None if no_rag is None else no_rag["text"],
             "no_rag_generation_status": no_rag,
