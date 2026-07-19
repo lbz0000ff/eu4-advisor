@@ -201,6 +201,25 @@ class AgenticRAGGraphTest(unittest.TestCase):
 
 
 class LLMDecisionContractTest(unittest.TestCase):
+    def test_planner_enforces_keyword_limit_on_tool_arguments(self) -> None:
+        planner = make_llm_planner(LLMConfig(model="deepseek-v4-flash"))
+        oversized = {
+            "queries": [
+                {
+                    "query_en": "Crownland mechanics",
+                    "keywords": ["one", "two", "three", "four", "five", "six"],
+                }
+            ]
+        }
+
+        with patch.object(
+            agentic_rag, "call_function_tool", return_value=oversized
+        ) as tool_call:
+            result = planner("How does Crownland work?")
+
+        self.assertEqual(result.queries[0].keywords, ["one", "two", "three", "four", "five"])
+        tool_call.assert_called_once()
+
     def test_planner_disables_thinking_for_forced_tool_call(self) -> None:
         planner = make_llm_planner(LLMConfig(model="deepseek-v4-flash"))
         valid = {

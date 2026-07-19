@@ -700,6 +700,10 @@ def is_transient_connection_error(error: BaseException) -> bool:
     return False
 
 
+class EmptyAnswerError(RuntimeError):
+    """The generator completed without producing answer text."""
+
+
 def _failure_state(error: Exception, transient: bool, attempts: int) -> dict[str, Any]:
     error_type = type(error).__name__
     error_message = str(error)
@@ -728,14 +732,23 @@ def _run_with_connection_retries(
     for attempt in range(1, attempts + 1):
         try:
             state = operation()
+            answer_text = state.get("answer", "")
+            if not isinstance(answer_text, str) or not answer_text.strip():
+                raise EmptyAnswerError("model returned an empty answer")
             state["attempts"] = attempt
             return state
         except Exception as error:
             transient = is_transient_connection_error(error)
-            if transient and attempt < attempts:
+            retryable = transient or isinstance(error, EmptyAnswerError)
+            if retryable and attempt < attempts:
                 delay = base_delay * (2 ** (attempt - 1))
+                reason = (
+                    "模型返回空答案"
+                    if isinstance(error, EmptyAnswerError)
+                    else "DeepSeek 连接失败"
+                )
                 print(
-                    f"  DeepSeek 连接失败，第 {attempt}/{attempts} 次，"
+                    f"  {reason}，第 {attempt}/{attempts} 次，"
                     f"{delay:g} 秒后重试..."
                 )
                 sleep_fn(delay)

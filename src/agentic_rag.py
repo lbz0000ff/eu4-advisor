@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable, TypedDict, cast
 
@@ -215,7 +216,16 @@ def _call_validated_tool(
                 config=config,
                 thinking=False,
             )
-            return model_type.model_validate(arguments)
+            normalized = copy.deepcopy(arguments)
+            for field in ("queries", "supplemental_queries"):
+                queries = normalized.get(field)
+                if not isinstance(queries, list):
+                    continue
+                normalized[field] = queries[:MAX_QUERIES_PER_ROUND]
+                for query in normalized[field]:
+                    if isinstance(query, dict) and isinstance(query.get("keywords"), list):
+                        query["keywords"] = query["keywords"][:5]
+            return model_type.model_validate(normalized)
         except (ToolCallError, ValidationError, OpenAIError) as exc:
             failures.append(str(exc))
             last_error = exc

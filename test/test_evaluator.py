@@ -44,6 +44,30 @@ class RagAnswerTest(unittest.TestCase):
 
 
 class AgenticEvaluationTest(unittest.TestCase):
+    def test_empty_graph_answer_is_retried(self) -> None:
+        graph = unittest.mock.MagicMock()
+        graph.invoke.side_effect = [
+            {
+                "answer": "",
+                "retrieved_results": [{"text": "context"}],
+                "trace": {"plans": [], "retrievals": [], "coverage": []},
+            },
+            {
+                "answer": "recovered",
+                "retrieved_results": [{"text": "context"}],
+                "trace": {"plans": [], "retrievals": [], "coverage": []},
+            },
+        ]
+        sleep = unittest.mock.MagicMock()
+
+        result = evaluator.run_agentic_question(
+            graph, "query", base_delay=2.0, sleep_fn=sleep
+        )
+
+        self.assertEqual(graph.invoke.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(result["answer"], "recovered")
+
     def test_transient_connection_failure_retries_with_exponential_backoff(self) -> None:
         graph = unittest.mock.MagicMock()
         graph.invoke.side_effect = [
@@ -182,6 +206,28 @@ class EvaluationModeTest(unittest.TestCase):
                 "answer",
                 side_effect=[ConnectionError("network down"), "recovered"],
             ) as generate,
+        ):
+            state = evaluator.run_baseline_question(
+                "original query",
+                embedder="embedder",
+                index="index",
+                reranker="reranker",
+                generator_config=evaluator.LLMConfig(model="model"),
+                base_delay=2.0,
+                sleep_fn=sleep,
+            )
+
+        search.assert_called_once()
+        self.assertEqual(generate.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(state["answer"], "recovered")
+
+    def test_baseline_retries_empty_generation_without_repeating_retrieval(self) -> None:
+        retrieved = [{"chunk_index": 1, "text": "context", "source": "wiki.md"}]
+        sleep = unittest.mock.MagicMock()
+        with (
+            patch.object(evaluator, "hybrid_search", return_value=retrieved) as search,
+            patch.object(evaluator, "answer", side_effect=["", "recovered"]) as generate,
         ):
             state = evaluator.run_baseline_question(
                 "original query",
