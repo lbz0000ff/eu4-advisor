@@ -1,13 +1,24 @@
 """Cross-Encoder 重排 — 对混合检索初筛结果做二次精排。"""
+import os
 import time
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 class Reranker:
     """Cross-Encoder 重排器，懒加载模型。"""
 
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
-        self.model_name = model_name
+    def __init__(self, model_name: Optional[str] = None):
+        self.model_name = (
+            model_name
+            or os.environ.get("RERANKER_MODEL")
+            or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        )
         self._model = None
 
     @property
