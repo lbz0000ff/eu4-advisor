@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""一键初始化：爬取 Wiki、分块、建索引并验证。"""
+"""一键初始化：爬取、归一化、分块、建索引并验证。"""
 import subprocess
 import sys
 from pathlib import Path
@@ -14,16 +14,19 @@ def step(msg: str) -> None:
 
 
 def main() -> None:
-    step("1/4 爬取 EU4 Wiki...")
-    subprocess.run([sys.executable, "src/crawler.py"], cwd=ROOT, check=True)
+    step("1/5 通过 MediaWiki API 爬取 EU4 Wiki...")
+    subprocess.run([sys.executable, "scripts/crawl_wiki.py"], cwd=ROOT, check=True)
 
-    step("2/4 分块处理...")
+    step("2/5 归一化 Markdown...")
+    subprocess.run([sys.executable, "src/markdown_normalizer.py"], cwd=ROOT, check=True)
+
+    step("3/5 分块处理...")
     subprocess.run([sys.executable, "src/chunk.py"], cwd=ROOT, check=True)
 
-    step("3/4 构建 FAISS 索引，首次运行会下载 Embedding 模型...")
+    step("4/5 构建 FAISS 索引，首次运行会下载 Embedding 模型...")
     subprocess.run([sys.executable, "src/embed.py"], cwd=ROOT, check=True)
 
-    step("4/4 验证...")
+    step("5/5 验证...")
     result = subprocess.run(
         [sys.executable, "src/rag.py", "what is oirat", "--top-k", "3"],
         cwd=ROOT,

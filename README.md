@@ -21,6 +21,7 @@
 主要能力：
 
 - 将中文问法转换为英文 Wiki 检索式，并拆解多方面问题。
+- 通过 MediaWiki API 分层发现页面，并沿国家页中的任务树和事件引用继续 BFS 爬取。
 - 使用 FAISS 语义检索与 BM25 关键词检索，经 RRF 融合和 Cross-Encoder 重排。
 - 按 Markdown 标题层级分块，将表格逐行展开并保留父表信息。
 - 使用 LangGraph 保存查询计划、检索轮次、证据覆盖判断和最终回答。
@@ -81,7 +82,9 @@ RERANKER_MODEL=D:/models/ms-marco-MiniLM-L-6-v2
 python scripts/setup.py
 ```
 
-该脚本依次执行 Wiki 页面爬取、结构化分块、Embedding 计算和 FAISS 索引构建。Wiki 原文、分块结果和索引均为本地生成内容，不包含在仓库中。
+该脚本依次执行 MediaWiki API 爬取、Markdown 归一化、结构化分块、Embedding 计算和 FAISS 索引构建。爬虫会从国家页和游戏概念分类开始，并沿任务树与事件引用继续获取页面，完整运行需要较长时间且依赖 Wiki 可访问。
+
+Wiki 原文、归一化文档、分块结果和索引均为本地生成内容，不包含在仓库中。爬取过程可断点续跑，已存在页面会被跳过。
 
 ### 5. 运行问答
 
@@ -130,14 +133,18 @@ OiratRAG/
 │   ├── embed.py             # Embedding 与 FAISS 索引
 │   ├── reranker.py          # Cross-Encoder 重排
 │   ├── chunk.py             # Markdown 与表格分块
-│   ├── crawler.py           # Wiki 数据采集
+│   ├── eu4_crawler.py       # MediaWiki API 与 wikitext 清洗
+│   ├── batch_crawl.py       # 页面发现、批量爬取与状态记录
+│   ├── markdown_normalizer.py # Markdown 二次归一化
 │   ├── llm.py               # OpenAI 兼容模型接口
 │   ├── test.py              # baseline 与 Agentic RAG 评测
 │   └── gui.py               # Gradio 界面
 ├── eval/
 │   ├── queries.json         # 60 条中英双语项目测试问题
 │   └── queries_v1.json      # 旧版测试问题备份
-├── scripts/setup.py         # 数据采集、分块与建索引
+├── scripts/
+│   ├── crawl_wiki.py        # 分层 BFS 爬取策略
+│   └── setup.py             # 爬取、归一化、分块与建索引
 ├── test/                    # 单元测试
 ├── .env.example
 └── requirements.txt

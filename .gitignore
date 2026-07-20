@@ -29,6 +29,7 @@ test/*
 !test/test_agentic_rag.py
 !test/test_evaluator.py
 !test/test_setup.py
+!test/test_data_pipeline.py
 src/debug_*.py
 src/test_*.py
 src/check_*.py
