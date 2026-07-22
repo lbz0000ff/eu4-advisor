@@ -1,7 +1,7 @@
 """
-RAG 评测脚本 — 自动跑 50 条中英文查询，输出评测报告。
+Agentic RAG 运行报告 — 自动跑中英文查询，保存回答、检索摘要与决策轨迹。
 用法:
-    python eval/run_eval.py                     # 跑全部 50 条
+    python eval/run_eval.py                     # 跑全部 60 条
     python eval/run_eval.py --rerank            # 带 Cross-Encoder 重排
     python eval/run_eval.py --sample 10          # 只跑前 10 条
     python eval/run_eval.py --lang zh            # 只跑中文
@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from rag import hybrid_search, chunks, answer
+from rag import build_agentic_runtime, chunks
 from embed import Embedder
 from llm import LLMConfig
 import faiss
@@ -35,6 +35,14 @@ reranker = None
 if "--rerank" in sys.argv:
     from reranker import get_reranker
     reranker = get_reranker()
+
+agentic_graph = build_agentic_runtime(
+    embedder,
+    faiss_index,
+    reranker=reranker,
+    top_k=5,
+    llm_config=LLMConfig(),
+)
 
 # 过滤参数
 sample = None
@@ -71,12 +79,12 @@ for i, item in enumerate(queries, 1):
 
     t0 = time.time()
 
-    # 只测检索（不调 LLM），看 top-5 的 RRF 分数
-    hits = hybrid_search(
-        q, embedder, faiss_index,
-        top_k=5, category="", verbose=False,
-        reranker=reranker,
+    # 每个问题通过图完成规划、检索、覆盖检查与回答。
+    state = agentic_graph.invoke(
+        {"original_query": q},
+        config={"recursion_limit": 10},
     )
+    hits = state["retrieved_results"]
 
     t = time.time() - t0
     times.append(t)
@@ -97,6 +105,8 @@ for i, item in enumerate(queries, 1):
         "top_score": round(top_score, 4),
         "top_sources": sources,
         "n_results": len(hits),
+        "answer": state["answer"],
+        "agent_trace": state["trace"],
     })
 
     # 每 10 条打印进度
@@ -110,7 +120,7 @@ print("=" * 60)
 print(f"总查询: {len(results)}")
 print(f"平均耗时: {sum(times)/len(times):.2f}s")
 print(f"中位耗时: {sorted(times)[len(times)//2]:.2f}s")
-print(f"平均 Top-1 RRF 分数: {sum(retrieval_scores)/len(retrieval_scores):.4f}")
+print(f"平均 Top-1 分数: {sum(retrieval_scores)/len(retrieval_scores):.4f}")
 print()
 
 # 按语言统计

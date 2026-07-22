@@ -17,8 +17,8 @@ import re
 import sys
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent.parent / "data"
-OUT_DIR = Path(__file__).parent.parent / "data_normalized"
+DATA_DIR = Path(__file__).parent.parent / "data" / "raw_data"
+OUT_DIR = Path(__file__).parent.parent / "data" / "data_normalized"
 
 
 # ─── 正则 ───
@@ -153,7 +153,7 @@ def normalize_text(text: str) -> str:
 
         # ── +/- 数值前缀 → 列表项 ──
         if RE_PLUS_MINUS.match(stripped):
-            out.append("- " + stripped.lstrip("+−\-"))
+            out.append("- " + stripped.lstrip("+−-"))
             i += 1
             continue
 

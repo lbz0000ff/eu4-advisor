@@ -1,18 +1,31 @@
-# OiratRAG — EU4 Wiki 检索增强问答系统
+# EU4 Advisor
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-面向《Europa Universalis IV》Wiki 的中英文混合 RAG 问答系统。支持中文查询自动翻译与扩展、FAISS + BM25 混合检索、Cross-Encoder 重排。
+面向《Europa Universalis IV》英文 Wiki 的中英双语 Agentic RAG 问答系统。项目使用 LangGraph 组织查询规划、混合检索、证据覆盖判断和补充检索，并通过 FAISS、BM25、RRF 与 Cross-Encoder 完成检索和重排。
 
-## 功能
+## 核心流程
 
-- **中英文混合查询** — 中文问题自动翻译成英文检索词，同时提取关键词给 BM25
-- **混合检索** — FAISS 语义检索 + BM25 关键词检索 + RRF 融合 + Cross-Encoder 重排
-- **结构化分块** — 基于标题层级 + 表格行级展开，保留父表引用
-- **查询扩展** — LLM 自动补充 EU4 领域同义词，提高检索命中率
-- **Web GUI** — Gradio 界面，支持分类过滤和重排开关
-- **CLI 交互** — 命令行问答和对比评测模式
+```text
+用户问题
+  -> LLM 生成最多 3 条英文检索式与 BM25 关键词
+  -> 每条检索式分别执行 FAISS 与 BM25 Top-24 召回
+  -> RRF 融合并使用 Cross-Encoder 重排
+  -> 合并、去重并保留 Top-8 证据
+  -> 判断证据是否覆盖问题
+       -> 充分：生成回答
+       -> 不充分：生成补充检索式，最多再检索一轮
+```
+
+主要能力：
+
+- 将中文问法转换为英文 Wiki 检索式，并拆解多方面问题。
+- 通过 MediaWiki API 分层发现页面，并沿国家页中的任务树和事件引用继续 BFS 爬取。
+- 使用 FAISS 语义检索与 BM25 关键词检索，经 RRF 融合和 Cross-Encoder 重排。
+- 按 Markdown 标题层级分块，将表格逐行展开并保留父表信息。
+- 使用 LangGraph 保存查询计划、检索轮次、证据覆盖判断和最终回答。
+- 提供单轮混合检索与 Agentic RAG 两种评测模式。
 
 ## 快速开始
 
@@ -22,129 +35,130 @@
 pip install -r requirements.txt
 ```
 
-### 2. 配置 API Key
+### 2. 配置模型 API
 
-创建 `.env` 文件（已提供模板），填入你的 API Key：
+复制 `.env.example` 为 `.env`，至少填写生成模型配置：
 
 ```env
 LLM_BASE_URL=https://api.deepseek.com
-LLM_API_KEY=sk-your-key-here
+LLM_API_KEY=
 LLM_MODEL=deepseek-chat
 ```
 
-支持任何 OpenAI 兼容的 API，切换只需改 `.env`：
+生成模型和评测模型均使用 OpenAI 兼容接口。运行 LLM-as-Judge 评测时，还需填写 `JUDGE_BASE_URL`、`JUDGE_API_KEY` 和 `JUDGE_MODEL`，也可以使用模板中保留的 UUAPI 兼容变量。
 
-```env
-# 本地 Ollama
-LLM_BASE_URL=http://localhost:8000/v1
-LLM_API_KEY=not-needed
-LLM_MODEL=qwen2.5:14b
+`.env` 已被 Git 忽略，不要把真实密钥写入 `.env.example`。
 
-# OpenAI
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=sk-xxx
-LLM_MODEL=gpt-4o-mini
+### 3. 下载 Embedding 与重排模型
+
+默认使用以下 Hugging Face 模型：
+
+- `intfloat/multilingual-e5-large`
+- `cross-encoder/ms-marco-MiniLM-L-6-v2`
+
+首次建索引或启用重排时，Sentence Transformers 会自动下载所需模型。国内网络可在运行前设置 Hugging Face 镜像：
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+python scripts/setup.py
 ```
 
-### 3. 初始化（爬取 Wiki + 建索引）
+```bash
+HF_ENDPOINT=https://hf-mirror.com python scripts/setup.py
+```
+
+也可以从 Hugging Face 或镜像站手动下载模型，再在 `.env` 中填写本地目录：
+
+```env
+EMBEDDING_MODEL=D:/models/multilingual-e5-large
+RERANKER_MODEL=D:/models/ms-marco-MiniLM-L-6-v2
+```
+
+模型文件不会提交到仓库。
+
+### 4. 获取 Wiki 数据并建立索引
 
 ```bash
 python scripts/setup.py
 ```
 
-这将依次执行：爬取 Wiki 页面 → 分块处理 → 构建 FAISS 索引。首次运行需下载 embedding 模型（约 2GB）。
+该脚本依次执行 MediaWiki API 爬取、Markdown 归一化、结构化分块、Embedding 计算和 FAISS 索引构建。爬虫会从国家页和游戏概念分类开始，并沿任务树与事件引用继续获取页面，完整运行需要较长时间且依赖 Wiki 可访问。
 
-### 4. 运行
+Wiki 原文、归一化文档、分块结果和索引均为本地生成内容，不包含在仓库中。爬取过程可断点续跑，已存在页面会被跳过。
 
-**Web 界面：**
+### 5. 运行问答
+
+```bash
+python src/rag.py "训练度和士气有什么区别" --rerank
+python src/rag.py "How does discipline affect combat?" --rerank
+```
+
+不传问题时进入交互模式：
+
+```bash
+python src/rag.py --rerank
+```
+
+Web 界面：
+
 ```bash
 python src/gui.py
 ```
 
-**命令行问答：**
+## 评测
+
+项目测试集包含 60 条中英双语问题，其中 30 组问题互为中英文语义对应，并包含不可回答问题。生成模型使用 DeepSeek V4 Flash，GPT-5.5 作为独立 Judge，按照检索精确率、检索召回率、回答忠实度和回答相关性分别评分。
+
 ```bash
-python src/rag.py "瓦剌是什么国家"
-python src/rag.py "how to form prussia" --rerank
+python src/test.py --mode baseline --output eval/results/baseline.json
+python src/test.py --mode agentic --output eval/results/agentic.json
 ```
 
-**交互模式：**
-```bash
-python src/rag.py
-```
+完整 60 题结果：
+
+| 模式 | 检索精确率 | 检索召回率 | 回答忠实度 | 回答相关性 |
+|---|---:|---:|---:|---:|
+| 原始问题单轮混合检索 | 0.408 | 0.591 | 0.866 | 0.573 |
+| Agentic RAG | 0.656 | 0.843 | 0.855 | 0.829 |
+
+逐题结果包含生成内容和调用轨迹，因此 `eval/results/` 默认不提交。评测题目和评测程序保留在仓库中，可使用自己的模型接口复现。
 
 ## 项目结构
 
-```
-Eu4RAG/
-├── src/                    # 核心代码
-│   ├── rag.py              # RAG 主流程（检索 + 问答）
-│   ├── embed.py            # Embedding + FAISS 索引构建
-│   ├── llm.py              # LLM 调用封装（OpenAI 兼容）
-│   ├── chunk.py            # 维基页面分块
-│   ├── crawler.py          # EU4 Wiki 爬虫
-│   ├── gui.py              # Gradio Web 界面
-│   └── reranker.py         # Cross-Encoder 重排
-├── eval/                   # 评测集（中英文 160+ 条）
-│   ├── queries.json
-│   └── run_eval.py
+```text
+eu4-advisor/
+├── src/
+│   ├── agentic_rag.py       # LangGraph 查询规划与覆盖反馈
+│   ├── rag.py               # 混合检索、回答生成与 CLI
+│   ├── embed.py             # Embedding 与 FAISS 索引
+│   ├── reranker.py          # Cross-Encoder 重排
+│   ├── chunk.py             # Markdown 与表格分块
+│   ├── eu4_crawler.py       # MediaWiki API 与 wikitext 清洗
+│   ├── batch_crawl.py       # 页面发现、批量爬取与状态记录
+│   ├── markdown_normalizer.py # Markdown 二次归一化
+│   ├── llm.py               # OpenAI 兼容模型接口
+│   ├── test.py              # baseline 与 Agentic RAG 评测
+│   └── gui.py               # Gradio 界面
+├── eval/
+│   ├── queries.json         # 60 条中英双语项目测试问题
+│   └── queries_v1.json      # 旧版测试问题备份
 ├── scripts/
-│   └── setup.py            # 一键初始化脚本
-├── data/                   # 数据（gitignore，运行 setup 生成）
-│   ├── raw/                # 爬取的 Wiki 页面
-│   ├── chunks/             # 分块结果
-│   └── index/              # FAISS 索引
-├── .env                    # API 配置模板
+│   ├── crawl_wiki.py        # 分层 BFS 爬取策略
+│   └── setup.py             # 爬取、归一化、分块与建索引
+├── test/                    # 单元测试
+├── .env.example
 └── requirements.txt
 ```
 
-## 检索流程
-
-```
-用户查询 (中/英/混合)
-    ↓
-LLM 预处理（翻译 + 关键词提取 + 查询扩展）
-    ↓
-┌─ FAISS 语义检索 (top-72) ─┐
-│ BM25 关键词检索 (top-72)  │
-└────── RRF 融合 ──────────┘
-    ↓ top-24
-Cross-Encoder 重排
-    ↓ top-8
-LLM 生成回答
-```
-
-## 评测
+## 测试
 
 ```bash
-# 跑 10 条样本
-python src/test.py --sample 10
-
-# 跑全部 160+ 条
-python src/test.py
+python -m unittest discover -s test -p "test_*.py"
 ```
 
-评测指标：
-- **Contextual Precision** — 检索结果中相关 chunk 的比例
-- **Contextual Recall** — 检索结果对问题的信息覆盖度
-- **Faithfulness** — 回答是否忠实于检索内容
-- **Answer Relevancy** — 回答是否扣题
+## 数据与版权
 
-## 技术栈
-
-| 组件 | 选型 |
-|---|---|
-| Embedding | intfloat/multilingual-e5-large (1024d) |
-| 向量检索 | FAISS IndexFlatIP (余弦相似度) |
-| 关键词检索 | BM25Okapi (rank_bm25) |
-| 重排 | cross-encoder/ms-marco-MiniLM-L-6-v2 |
-| 融合策略 | RRF (K=20) |
-| LLM | DeepSeek / OpenAI / 本地模型 (OpenAI 兼容) |
-| 分块 | MarkdownHeaderTextSplitter + RecursiveCharacter |
-| UI | Gradio |
-
-## 免责声明
-
-本项目使用的 Wiki 数据来源于 [Europa Universalis IV Wiki](https://eu4.paradoxwikis.com/)，版权归 Paradox Interactive 和 Wiki 贡献者所有。本仓库仅包含代码，不包含 Wiki 内容。用户需自行运行爬虫获取数据。
+Wiki 数据来源于 [Europa Universalis IV Wiki](https://eu4.paradoxwikis.com/)，版权归 Paradox Interactive 和 Wiki 贡献者所有。本仓库仅包含代码和项目测试问题，不包含 Wiki 原文。
 
 ## License
 

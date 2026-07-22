@@ -39,35 +39,6 @@ DEFAULT_SYSTEM_PROMPT = """
 - 如果没有找到任何相关信息，输出：知识库中未找到相关信息
 """
 
-PREPROCESSING_PROMPT = """
-你是游戏 Europa Universalis 4 的 Wiki query 处理员，将用户输入的问题转换为 JSON 格式的 query。
-
-# 规则：
-## 输出格式
-- query_en: 适合FAISS语义检索的英文查询
-- keywords: 适合BM25关键词检索的短语列表（2-5个）
-- sub_queries: 仅复杂问题填写（涉及多个机制/条件时拆解为2-3个子查询）
-
-## 只使用 EU4 Wiki 中实际出现的英文术语
-例如：
-- 把"也先太师/朱祁镇"写成"Ming Emperor"而不是"Esen Taishi/Zhu Qizhen"（Wiki中不用人名）
-- 把"土木堡之变"写成"Tumu Crisis"
-
-示例1：
-输入："瓦剌是什么国家"
-输出：{"query_en": "Oirat horde EU4 country Tengri", "keywords": ["Oirat", "Tengri", "steppe horde"], "sub_queries": []}
-
-示例2：
-输入："普鲁士怎么成立德国，需要什么理念"
-输出：{"query_en": "Prussia form Germany requirements national ideas", "keywords": ["Prussia", "Germany", "formation", "national ideas", "requirements"], "sub_queries": ["Prussia formation decision", "Prussian national ideas", "Germany unification"]}
-
-## 只输出JSON，不要多余内容。
-
-输入：{query}
-
-输出：
-"""
-
 # ═══════════════════════════
 # 1. 加载数据
 # ═══════════════════════════
@@ -101,65 +72,22 @@ def _get_bm25():
 
 
 def hybrid_search(
-    query: str,
+    query_en: str,
     embedder,
     faiss_index: faiss.Index,
     top_k: int = 8,
     category: str = "",
     verbose: bool = False,
-    reranker = None,
+    reranker=None,
+    keywords: list[str] | None = None,
 ) -> list[dict]:
-    """FAISS 语义检索 + BM25 关键词检索 + RRF 融合 + 可选 Cross-Encoder 重排。"""
+    """Search an already-planned English query with FAISS, BM25, RRF, and reranking."""
     import time
-    times = {}
+    times: dict[str, float] = {}
+    bm25_raw = " ".join(keywords) if keywords else query_en
+    print(f"  [query] FAISS: {query_en}  |  BM25: {bm25_raw}")
 
-    # query 预处理：LLM 翻译/扩展 + 关键词提取
     t0 = time.time()
-    query_en = query
-    bm25_raw = query
-    
-    from llm import chat
-    import json as _json
-    try:
-        prompt = PREPROCESSING_PROMPT.replace("{query}", query)
-        raw = chat(
-            messages=[{"role": "user", "content": prompt}],
-            config=LLMConfig(model="deepseek-v4-flash", max_tokens=200, temperature=0),
-        )
-        if raw and raw.strip():
-            text = raw.strip()
-            text = re.sub(r'```(?:json)?', '', text).strip()
-            # 尝试解析 JSON
-            parsed = None
-            try:
-                parsed = _json.loads(text, strict=False)
-            except _json.JSONDecodeError:
-                # 提取第一个 { 到最后一个 } 重试
-                try:
-                    start = text.find("{")
-                    end = text.rfind("}")
-                    if start >= 0 and end > start:
-                        parsed = _json.loads(text[start:end+1], strict=False)
-                except _json.JSONDecodeError:
-                    pass
-            if isinstance(parsed, dict) and len(parsed) > 0:
-                query_en = parsed.get("query_en", query_en)
-                kw = parsed.get("keywords", [])
-                bm25_raw = " ".join(kw) if kw else query_en
-                sq = parsed.get("sub_queries", [])
-                if sq:
-                    print(f"  [sub_queries] {sq}")
-            else:
-                # fallback: 直接取第一行作为英文查询
-                print(f"  [query_prep] parse failed, fallback")
-                lines = [l for l in text.split("\n") if l.strip()]
-                if lines:
-                    query_en = lines[0].strip()
-                    bm25_raw = query_en
-    except Exception as e:
-        print(f"  [query_prep] LLM error: {e}, using original query")
-        
-    print(f"  [query] {query} -> FAISS: {query_en}  |  BM25: {bm25_raw}")
     q_vec = embedder.embed(["query: " + query_en])
     faiss.normalize_L2(q_vec)
     faiss_scores, ids = faiss_index.search(q_vec, top_k * 3)
@@ -203,6 +131,7 @@ def hybrid_search(
     times["rrf"] = time.time() - t0
 
     # cross encoder
+    rerank_scores = {}
     if reranker:
         t0 = time.time()
         candidates = []
@@ -214,12 +143,19 @@ def hybrid_search(
                 "score": rrf_scores[idx],
             })
         reranked = reranker.rerank(query_en, candidates, top_k)
+        rerank_scores = {
+            c["index"]: c["rerank_score"]
+            for c in reranked
+        }
         top = [c["index"] for c in reranked]
         if verbose:
             print(f"  [timing] rerank: {time.time() - t0:.3f}s")
 
     if verbose:
-        print(f"  [timing] embed+faiss: {times['embed+faiss']:.3f}s  bm25: {times['bm25']:.3f}s  rrf: {times['rrf']:.3f}s")
+        print(
+            f"  [timing] embed+faiss: {times['embed+faiss']:.3f}s  "
+            f"bm25: {times['bm25']:.3f}s  rrf: {times['rrf']:.3f}s"
+        )
 
     # 导入parent table
     results = []
@@ -247,12 +183,16 @@ def hybrid_search(
                     tok_count += line_tok
                 content = chunk["text"] + "\n\n> 表格(前" + str(tok_count) + " tokens):\n" + "\n".join(truncated_lines)
 
+        final_score = rerank_scores.get(idx, rrf_scores[idx])
         results.append({
+            "chunk_index": idx,
             "text": content,
             "source": chunk["source_file"],
             "category": chunk["category"],
             "section": chunk["section"],
-            "score": rrf_scores[idx],
+            "score": final_score,
+            "rrf_score": rrf_scores[idx],
+            "rerank_score": rerank_scores.get(idx),
         })
     return results
 
@@ -270,6 +210,7 @@ def answer(
     use_rag: bool = True,
     top_k: int = 8,
     reranker=None,
+    retrieved_results: list[dict] | None = None,
 ) -> str:
     if llm_config is None:
         llm_config = LLMConfig()
@@ -281,7 +222,17 @@ def answer(
             config=llm_config, system_prompt=DEFAULT_SYSTEM_PROMPT,
         )
 
-    results = hybrid_search(query, embedder, faiss_index, top_k, category, verbose=True, reranker=reranker)
+    results = retrieved_results
+    if results is None:
+        results = hybrid_search(
+            query,
+            embedder,
+            faiss_index,
+            top_k,
+            category,
+            verbose=True,
+            reranker=reranker,
+        )
 
     context = "\n\n".join(
         f"[{i}] {r['source']}" + (f" / {r['section']}" if r['section'] else "")
@@ -296,14 +247,61 @@ def answer(
     )
 
 
-def compare(query: str, embedder, faiss_index, category: str = "", reranker=None):
-    llm_cfg = LLMConfig()
+def build_agentic_runtime(
+    embedder,
+    faiss_index,
+    reranker=None,
+    category: str = "",
+    top_k: int = 8,
+    llm_config: LLMConfig | None = None,
+):
+    """Build the graph around prepared English retrieval queries."""
+    from agentic_rag import (
+        AgenticRAGServices,
+        build_agentic_graph,
+        make_llm_coverage_checker,
+        make_llm_planner,
+    )
+
+    config = llm_config or LLMConfig(
+        model="deepseek-v4-flash", temperature=0, max_tokens=600
+    )
+
+    def retrieve(planned):
+        return hybrid_search(
+            planned.query_en,
+            embedder,
+            faiss_index,
+            top_k=top_k,
+            category=category,
+            verbose=True,
+            reranker=reranker,
+            keywords=planned.keywords,
+        )
+
+    def generate(query, evidence, missing_aspects):
+        return answer(query, llm_config=config, retrieved_results=evidence)
+
+    services = AgenticRAGServices(
+        planner=make_llm_planner(config),
+        retriever=retrieve,
+        coverage_checker=make_llm_coverage_checker(config),
+        answer_generator=generate,
+    )
+    return build_agentic_graph(services, top_k=top_k)
+
+
+def compare(query: str, agentic_graph, llm_config: LLMConfig):
     print(f"\n{'='*60}\n问题: {query}\n{'='*60}\n")
     print("--- 不带 RAG ---")
-    print(answer(query, use_rag=False))
+    print(answer(query, llm_config=llm_config, use_rag=False))
     print()
     print("--- 带 RAG ---")
-    print(answer(query, embedder=embedder, faiss_index=faiss_index, category=category, reranker=reranker))
+    state = agentic_graph.invoke(
+        {"original_query": query},
+        config={"recursion_limit": 10},
+    )
+    print(state["answer"])
     print()
 
 
@@ -348,15 +346,26 @@ if __name__ == "__main__":
     print(f"  索引: {index_name}")
 
     llm_cfg = LLMConfig(provider=args.provider, model=args.model)
+    agentic_graph = build_agentic_runtime(
+        embedder,
+        faiss_index,
+        reranker=reranker,
+        category=args.category,
+        top_k=args.top_k,
+        llm_config=llm_cfg,
+    )
 
     if args.query:
         if args.compare:
-            compare(args.query, embedder, faiss_index, args.category, reranker=reranker)
+            compare(args.query, agentic_graph, llm_cfg)
+        elif args.no_rag:
+            print(answer(args.query, llm_config=llm_cfg, use_rag=False))
         else:
-            print(answer(args.query, embedder=embedder, faiss_index=faiss_index,
-                         category=args.category, llm_config=llm_cfg,
-                         use_rag=not args.no_rag, top_k=args.top_k,
-                         reranker=reranker))
+            state = agentic_graph.invoke(
+                {"original_query": args.query},
+                config={"recursion_limit": 10},
+            )
+            print(state["answer"])
     else:
         label = f"[{args.category}] " if args.category else ""
         print(f"Eu4RAG {label}(/quit)")
@@ -365,10 +374,12 @@ if __name__ == "__main__":
             if q.lower() in ("/quit", "/exit", "/q"):
                 break
             if args.compare:
-                compare(q, embedder, faiss_index, args.category)
+                compare(q, agentic_graph, llm_cfg)
+            elif args.no_rag:
+                print(f"\n{answer(q, llm_config=llm_cfg, use_rag=False)}")
             else:
-                r = answer(q, embedder=embedder, faiss_index=faiss_index,
-                           category=args.category, llm_config=llm_cfg,
-                           use_rag=not args.no_rag, top_k=args.top_k,
-                           reranker=reranker)
-                print(f"\n{r}")
+                state = agentic_graph.invoke(
+                    {"original_query": q},
+                    config={"recursion_limit": 10},
+                )
+                print(f"\n{state['answer']}")

@@ -4,6 +4,7 @@
 """
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -11,17 +12,24 @@ from collections import defaultdict
 
 import numpy as np
 import faiss
+from dotenv import load_dotenv
 
 CHUNKS_PATH = Path(__file__).parent.parent / "data" / "chunks"
 INDEX_PATH = Path(__file__).parent.parent / "data" / "index"
-DIM = 1024  # bge-m3 维度
+DIM = 1024  # multilingual-e5-large 维度
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 class Embedder:
     """轻量 Embedding 模型封装（自动选择 CPU/GPU）"""
 
-    def __init__(self, model_name: str = "intfloat/multilingual-e5-large"):
-        self.model_name = model_name
+    def __init__(self, model_name: Optional[str] = None):
+        self.model_name = (
+            model_name
+            or os.environ.get("EMBEDDING_MODEL")
+            or "intfloat/multilingual-e5-large"
+        )
         self._model = None
 
     def _pick_device(self) -> str:
@@ -55,12 +63,13 @@ class Embedder:
         """批量 embedding，返回 float32 二维数组 (N, DIM)（已 L2 归一化）"""
         tag = "查询" if len(texts) <= 3 else "文本块"
         print(f"  Embedding {len(texts)} 个{tag}...")
-        return self.model.encode(
+        embeddings = self.model.encode(
             texts,
             batch_size=batch_size,
             normalize_embeddings=True,
             show_progress_bar=True,
         )
+        return np.ascontiguousarray(embeddings, dtype=np.float32)
 
 
 def build_category_index(embeddings: np.ndarray, ids: np.ndarray,

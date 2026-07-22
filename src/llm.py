@@ -1,8 +1,9 @@
 """LLM 调用封装 — 从 .env 读取配置，兼容任何 OpenAI 格式的 API"""
 
+import json
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -26,6 +27,11 @@ class LLMConfig:
     temperature: float = 0.3
     max_tokens: int = 1024
     base_url: str = ""
+    api_key: str = ""
+
+
+class ToolCallError(RuntimeError):
+    """The model did not return valid arguments for the requested function tool."""
 
 
 def _from_env(key: str, default: str = "") -> str:
@@ -36,13 +42,16 @@ def _from_env(key: str, default: str = "") -> str:
 def build_client(config: Optional[LLMConfig] = None) -> OpenAI:
     """从 .env 或 config 构建 OpenAI client，优先级：config > .env > 默认"""
     _ensure_env()
+    if config is None:
+        config = LLMConfig()
 
     base_url = (
         config.base_url
         or _from_env("LLM_BASE_URL", "https://api.deepseek.com")
     )
     api_key = (
-        _from_env("LLM_API_KEY")
+        config.api_key
+        or _from_env("LLM_API_KEY")
         or _from_env("DEEPSEEK_API_KEY")
     )
     if not api_key:
@@ -100,6 +109,65 @@ def chat(
         max_tokens=max_tokens,
     )
     return resp.choices[0].message.content
+
+
+def call_function_tool(
+    messages: list[dict],
+    tool_name: str,
+    description: str,
+    parameters: dict[str, Any],
+    config: Optional[LLMConfig] = None,
+    system_prompt: Optional[str] = None,
+    thinking: Optional[bool] = None,
+) -> dict[str, Any]:
+    _ensure_env()
+    if config is None:
+        config = LLMConfig()
+
+    full_messages: list[dict] = []
+    if system_prompt:
+        full_messages.append({"role": "system", "content": system_prompt})
+    full_messages.extend(messages)
+
+    request_kwargs: dict[str, Any] = {}
+    if thinking is not None:
+        request_kwargs["extra_body"] = {
+            "thinking": {"type": "enabled" if thinking else "disabled"}
+        }
+
+    response = build_client(config).chat.completions.create(
+        model=config.model or _from_env("LLM_MODEL", "deepseek-v4-flash"),
+        messages=full_messages,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": description,
+                "parameters": parameters,
+            },
+        }],
+        tool_choice={"type": "function", "function": {"name": tool_name}},
+        **request_kwargs,
+    )
+
+    calls = response.choices[0].message.tool_calls or []
+    matching = [
+        call
+        for call in calls
+        if getattr(getattr(call, "function", None), "name", None) == tool_name
+    ]
+    if not matching:
+        raise ToolCallError(f"model did not call required tool: {tool_name}")
+
+    try:
+        arguments = json.loads(getattr(matching[0].function, "arguments", None))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ToolCallError(f"invalid arguments for tool {tool_name}: {exc}") from exc
+    if not isinstance(arguments, dict):
+        raise ToolCallError(f"tool {tool_name} arguments must be an object")
+    return arguments
 
 
 if __name__ == "__main__":

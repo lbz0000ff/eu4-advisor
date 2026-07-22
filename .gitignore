@@ -8,6 +8,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
 
 # ── IDE / 编辑器 ──
 .vscode/
@@ -25,6 +26,10 @@ Thumbs.db
 
 # ── 旧测试文件 / 临时调试脚本 ──
 test/*
+!test/test_agentic_rag.py
+!test/test_evaluator.py
+!test/test_setup.py
+!test/test_data_pipeline.py
 src/debug_*.py
 src/test_*.py
 src/check_*.py
@@ -32,6 +37,10 @@ src/merge_index.py
 
 # ── 评测输出 ──
 answers.*
+eval/results/
+
+# ── 本机启动配置 ──
+run_rocm.bat
 
 # ── 生成的数据（重建索引时不保留） ──
 data/categories/
