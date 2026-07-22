@@ -1,4 +1,4 @@
-# OiratRAG
+# EU4 Advisor
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
@@ -126,7 +126,7 @@ python src/test.py --mode agentic --output eval/results/agentic.json
 ## 项目结构
 
 ```text
-OiratRAG/
+eu4-advisor/
 ├── src/
 │   ├── agentic_rag.py       # LangGraph 查询规划与覆盖反馈
 │   ├── rag.py               # 混合检索、回答生成与 CLI
